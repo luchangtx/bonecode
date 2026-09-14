@@ -975,6 +975,47 @@ enum SelfTest {
         check("revealTerminal 会展开终端面板", main.isTerminalVisible)
         check("展开后终端面板视图已构建", main.terminalPanel.isViewLoaded)
 
+        // ---- AI panel: Enter sends, Shift+Enter does not
+        check("AI 面板已就绪", main.aiPanel.isViewLoaded)
+        check("回车触发发送", main.aiPanel.shouldSend(forModifiers: []))
+        check("Shift+回车不发送（用于换行）", !main.aiPanel.shouldSend(forModifiers: [.shift]))
+        check("回车+其他修饰键仍发送", main.aiPanel.shouldSend(forModifiers: [.command]))
+
+        // ---- run state must be observable, otherwise the Run button looks dead
+        check("初始状态为未运行", !main.runner.isRunning)
+        if let runButton = main.toolbarRunButton {
+            check("运行按钮初始可用", runButton.isEnabled)
+        } else {
+            check("运行按钮已捕获", false)
+        }
+        if let stopButton = main.toolbarStopButton {
+            check("停止按钮初始禁用", !stopButton.isEnabled)
+        } else {
+            check("停止按钮已捕获", false)
+        }
+        check("运行状态标签初始为空", (main.toolbarRunStatusLabel?.stringValue ?? "x").isEmpty)
+
+        let runConfig = RunConfig.make(id: "selftest-run", name: "自检命令",
+                                       command: "echo BONECODE_RUN_OK",
+                                       directory: base.path, kind: "测试",
+                                       symbol: "play.fill")
+        main.runner.run(runConfig)
+        check("启动后状态为运行中", main.runner.isRunning)
+        check("启动后运行按钮被禁用", main.toolbarRunButton?.isEnabled == false)
+        check("启动后停止按钮可用", main.toolbarStopButton?.isEnabled == true)
+        check("启动后显示「运行中」",
+              main.toolbarRunStatusLabel?.stringValue.contains("运行中") == true,
+              detail: "'\(main.toolbarRunStatusLabel?.stringValue ?? "")'")
+        check("启动时终端面板已展开", main.isTerminalVisible)
+        pumpRunLoop(seconds: 1.5)
+
+        // `echo` finishes but the login shell stays alive, so the state holds
+        // until the session is closed — which must then clear it.
+        main.terminalPanel.closeTerminal()
+        check("关闭终端后状态回到未运行", !main.runner.isRunning)
+        check("关闭终端后运行按钮恢复可用", main.toolbarRunButton?.isEnabled == true)
+        check("关闭终端后状态标签清空", (main.toolbarRunStatusLabel?.stringValue ?? "x").isEmpty)
+
         // ---- force a full layout pass: layout recursion blows up here
         controller.window?.layoutIfNeeded()
         check("强制布局通过（无递归/无约束冲突）", true)

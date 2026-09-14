@@ -82,6 +82,11 @@ final class MainViewController: NSViewController {
     let runner = ProjectRunner()
     private let quickOpen = QuickOpenController()
 
+    /// Retained so the run controls can be updated as the state changes.
+    weak var toolbarRunButton: NSButton?
+    weak var toolbarStopButton: NSButton?
+    weak var toolbarRunStatusLabel: NSTextField?
+
     override func loadView() {
         let root = NSView()
         root.setBackground(ThemeManager.shared.current.windowBackground)
@@ -170,6 +175,10 @@ final class MainViewController: NSViewController {
             self?.sidebar.runPanel.reload()
             self?.refreshToolbarRunMenu()
         }
+        runner.onRunningStateChanged = { [weak self] _ in
+            self?.updateRunControls()
+        }
+        updateRunControls()
 
         sidebar.gitPanel.onShowDiff = { [weak self] request in
             self?.editorArea.openDiffTab(request)
@@ -289,6 +298,7 @@ final class MainViewController: NSViewController {
     @objc private func handleTheme() {
         statusBar.applyTheme()
         refreshStatusBar()
+        updateRunControls()
     }
 
     @objc private func handleActiveEditor() {
@@ -331,6 +341,25 @@ final class MainViewController: NSViewController {
             statusBar.setLanguage("")
             statusBar.setPosition("")
         }
+    }
+
+    /// Reflect the running state on the run controls. Without this the Run
+    /// button looks identical whether or not something is running.
+    func updateRunControls() {
+        let theme = ThemeManager.shared.current
+        let running = runner.isRunning
+
+        if let run = toolbarRunButton {
+            run.isEnabled = !running
+            run.contentTintColor = running ? theme.tertiaryText : theme.diffAddedText
+            run.toolTip = running ? "正在运行中" : "运行 (⌘R)"
+        }
+        if let stop = toolbarStopButton {
+            stop.isEnabled = running
+            stop.contentTintColor = running ? theme.diffRemovedText : theme.tertiaryText
+        }
+        toolbarRunStatusLabel?.stringValue = running ? "● 运行中" : ""
+        toolbarRunStatusLabel?.textColor = theme.diffAddedText
     }
 
     func refreshToolbarRunMenu() {
@@ -396,6 +425,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(themeChanged),
                                                name: .themeDidChange, object: nil)
         applyTheme()
+        mainViewController.updateRunControls()
     }
 
     deinit { NotificationCenter.default.removeObserver(self) }
@@ -417,6 +447,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
         static let runConfig = NSToolbarItem.Identifier("runConfig")
         static let run = NSToolbarItem.Identifier("run")
         static let stop = NSToolbarItem.Identifier("stop")
+        static let runStatus = NSToolbarItem.Identifier("runStatus")
         static let gitPull = NSToolbarItem.Identifier("gitPull")
         static let gitPush = NSToolbarItem.Identifier("gitPush")
         static let terminal = NSToolbarItem.Identifier("terminal")
@@ -428,7 +459,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
         [ItemID.openFolder, ItemID.save, .flexibleSpace,
-         ItemID.runConfig, ItemID.run, ItemID.stop, .flexibleSpace,
+         ItemID.runConfig, ItemID.run, ItemID.stop, ItemID.runStatus, .flexibleSpace,
          ItemID.gitPull, ItemID.gitPush, .flexibleSpace,
          ItemID.quickOpen, ItemID.search, .flexibleSpace,
          ItemID.terminal, ItemID.ai, ItemID.theme]
@@ -443,7 +474,8 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
         let item = NSToolbarItem(itemIdentifier: itemIdentifier)
         let vc = mainViewController
 
-        func button(_ symbol: String, _ tooltip: String, _ action: Selector, tint: NSColor? = nil) {
+        func button(_ symbol: String, _ tooltip: String, _ action: Selector,
+                    tint: NSColor? = nil, capture: ((NSButton) -> Void)? = nil) {
             let b = NSButton(title: "", target: vc, action: action)
             b.isBordered = false
             b.bezelStyle = .inline
@@ -455,6 +487,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
             b.widthAnchor.constraint(equalToConstant: 26).isActive = true
             b.heightAnchor.constraint(equalToConstant: 22).isActive = true
             item.view = b
+            capture?(b)
         }
 
         switch itemIdentifier {
@@ -480,11 +513,23 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
         case ItemID.run:
             item.label = "运行"
             button("play.fill", "运行 (⌘R)", #selector(MainViewController.runDefaultConfig),
-                   tint: ThemeManager.shared.current.diffAddedText)
+                   tint: ThemeManager.shared.current.diffAddedText) { [weak vc] b in
+                vc?.toolbarRunButton = b
+            }
         case ItemID.stop:
             item.label = "停止"
             button("stop.fill", "停止 (⌘.)", #selector(MainViewController.stopRunning),
-                   tint: ThemeManager.shared.current.diffRemovedText)
+                   tint: ThemeManager.shared.current.diffRemovedText) { [weak vc] b in
+                vc?.toolbarStopButton = b
+            }
+        case ItemID.runStatus:
+            item.label = "运行状态"
+            let label = NSTextField(labelWithString: "")
+            label.font = Fonts.ui(size: 11, weight: .medium)
+            label.textColor = ThemeManager.shared.current.diffAddedText
+            label.translatesAutoresizingMaskIntoConstraints = false
+            item.view = label
+            vc.toolbarRunStatusLabel = label
         case ItemID.gitPull:
             item.label = "拉取"
             button("arrow.down.to.line", "拉取 (git pull)", #selector(MainViewController.gitPull))

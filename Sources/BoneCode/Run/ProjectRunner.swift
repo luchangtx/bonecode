@@ -29,6 +29,12 @@ final class ProjectRunner {
 
     var onConfigsChanged: (() -> Void)?
 
+    /// True while a configuration launched from here is still running.
+    private(set) var isRunning = false
+    /// Notifies the toolbar so the run controls can reflect the state.
+    var onRunningStateChanged: ((Bool) -> Void)?
+    private var runningSession: TerminalSession?
+
     private var portWatchTimer: Timer?
     private var watchedSession: TerminalSession?
     private var didOpenBrowser = false
@@ -370,10 +376,15 @@ final class ProjectRunner {
             return
         }
 
-        terminal.runCommand(config.command,
-                            cwd: config.workingDirectory,
-                            title: config.name,
-                            workingDirectory: config.workingDirectory)
+        let session = terminal.runCommand(config.command,
+                                         cwd: config.workingDirectory,
+                                         title: config.name,
+                                         workingDirectory: config.workingDirectory)
+        runningSession = session
+        session.onProcessExit = { [weak self] in
+            self?.setRunning(false)
+        }
+        setRunning(true)
         AppState.shared.postStatus("已启动「\(config.name)」，输出在下方终端面板")
 
         if config.autoOpenBrowser || config.detectedPort != nil {
@@ -394,7 +405,14 @@ final class ProjectRunner {
     func stop() {
         stopPortWatch()
         AppState.shared.terminalPanel?.stopActiveProcess()
-        AppState.shared.postStatus("已发送中断信号")
+        AppState.shared.postStatus("已发送中断信号 (Ctrl-C)")
+    }
+
+    private func setRunning(_ value: Bool) {
+        guard isRunning != value else { return }
+        isRunning = value
+        if !value { runningSession = nil }
+        onRunningStateChanged?(value)
     }
 
     // MARK: - Port detection → browser

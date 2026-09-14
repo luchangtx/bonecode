@@ -18,6 +18,7 @@ final class AIPanelViewController: NSViewController {
     private var applyButtons: [NSButton] = []
     private var applyBarHeight: NSLayoutConstraint!
     private let quickStack = NSStackView()
+    private let inputHint = NSTextField(labelWithString: "回车发送 · Shift+回车换行")
 
     private var history: [AIService.Message] = []
     private var isStreaming = false
@@ -138,7 +139,6 @@ final class AIPanelViewController: NSViewController {
         sendButton.font = Fonts.ui(size: 11, weight: .medium)
         sendButton.target = self
         sendButton.action = #selector(sendMessage)
-        sendButton.keyEquivalent = "\r"
         sendButton.translatesAutoresizingMaskIntoConstraints = false
 
         stopButton.title = "停止"
@@ -149,6 +149,11 @@ final class AIPanelViewController: NSViewController {
         stopButton.action = #selector(stopStreaming)
         stopButton.isHidden = true
         stopButton.translatesAutoresizingMaskIntoConstraints = false
+
+        inputHint.font = Fonts.ui(size: 10)
+        inputHint.textColor = ThemeManager.shared.current.tertiaryText
+        inputHint.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(inputHint)
 
         root.addSubview(header)
         root.addSubview(quickStack)
@@ -191,7 +196,11 @@ final class AIPanelViewController: NSViewController {
 
             stopButton.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -5),
             stopButton.centerYAnchor.constraint(equalTo: sendButton.centerYAnchor),
-            stopButton.widthAnchor.constraint(equalToConstant: 62)
+            stopButton.widthAnchor.constraint(equalToConstant: 62),
+
+            inputHint.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 10),
+            inputHint.centerYAnchor.constraint(equalTo: sendButton.centerYAnchor),
+            inputHint.trailingAnchor.constraint(lessThanOrEqualTo: stopButton.leadingAnchor, constant: -6)
         ])
 
         view = root
@@ -211,6 +220,7 @@ final class AIPanelViewController: NSViewController {
         header.setBackground(theme.tabBarBackground)
         applyBar.setBackground(theme.accentSoft)
         applyLabel.textColor = theme.accent
+        inputHint.textColor = theme.tertiaryText
         titleLabel.textColor = theme.text
         modelLabel.textColor = theme.tertiaryText
         transcriptView.backgroundColor = theme.panelBackground
@@ -699,16 +709,28 @@ final class AIPanelViewController: NSViewController {
 }
 
 extension AIPanelViewController: NSTextViewDelegate {
+
+    /// Enter sends, Shift+Enter inserts a newline so multi-line prompts are
+    /// still possible. The send button deliberately has no key equivalent —
+    /// otherwise the key-equivalent machinery swallows Return before the text
+    /// view's delegate ever sees it.
     func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         guard textView === inputView else { return false }
-        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-            let flags = NSApp.currentEvent?.modifierFlags ?? []
-            if flags.contains(.command) || flags.isEmpty {
-                sendMessage()
-                return true
-            }
+        guard commandSelector == #selector(NSResponder.insertNewline(_:)) else { return false }
+
+        let flags = (NSApp.currentEvent?.modifierFlags ?? [])
+            .intersection(.deviceIndependentFlagsMask)
+        guard shouldSend(forModifiers: flags) else {
+            return false        // let AppKit insert a real newline
         }
-        return false
+        sendMessage()
+        return true
+    }
+
+    /// Plain Return sends; Shift+Return inserts a newline so multi-line prompts
+    /// remain possible.
+    func shouldSend(forModifiers flags: NSEvent.ModifierFlags) -> Bool {
+        !flags.contains(.shift)
     }
 }
 

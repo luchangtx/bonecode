@@ -12,6 +12,8 @@ final class TerminalSession {
     var pendingCommand: String?
     var lastExitCode: Int32?
     var workingDirectory: String?
+    /// Called when the process in this session ends, however it ends.
+    var onProcessExit: (() -> Void)?
 
     init(cols: Int, rows: Int, title: String) {
         self.emulator = TerminalEmulator(cols: cols, rows: rows)
@@ -309,6 +311,7 @@ final class TerminalPanelController: NSViewController {
                 ? "\n\u{1B}[90m[进程已结束]\u{1B}[0m\n"
                 : "\n\u{1B}[31m[进程已结束，退出码 \(code)]\u{1B}[0m\n"
             session.emulator.feed(Data(message.utf8))
+            session.onProcessExit?()
             self?.refreshTabs()
         }
 
@@ -382,6 +385,8 @@ final class TerminalPanelController: NSViewController {
         guard activeIndex >= 0, activeIndex < sessions.count else { return }
         let session = sessions[activeIndex]
         session.pty?.terminate()
+        session.isRunning = false
+        session.onProcessExit?()
         if let token = frameObservers[ObjectIdentifier(session)] {
             NotificationCenter.default.removeObserver(token)
             frameObservers.removeValue(forKey: ObjectIdentifier(session))
@@ -397,7 +402,11 @@ final class TerminalPanelController: NSViewController {
     }
 
     func terminateAll() {
-        for session in sessions { session.pty?.terminate() }
+        for session in sessions {
+            session.pty?.terminate()
+            session.isRunning = false
+            session.onProcessExit?()
+        }
     }
 
     func stopActiveProcess() {
@@ -405,10 +414,13 @@ final class TerminalPanelController: NSViewController {
     }
 
     /// Run a command in a fresh terminal tab, creating the panel content if needed.
-    func runCommand(_ command: String, cwd: String?, title: String, workingDirectory: String? = nil) {
+    @discardableResult
+    func runCommand(_ command: String, cwd: String?, title: String,
+                    workingDirectory: String? = nil) -> TerminalSession {
         let session = createSession(cwd: workingDirectory ?? cwd, command: command, title: title)
         session.workingDirectory = workingDirectory ?? cwd
         refreshTabs()
+        return session
     }
 
     @objc private func handleSendText(_ note: Notification) {
