@@ -1,5 +1,95 @@
 import AppKit
 
+/// One draw operation for a terminal row.
+struct TerminalDrawOp {
+    let x: CGFloat
+    let text: String
+    let font: NSFont
+    let color: NSColor
+    let flags: UInt16
+    /// When non-nil, the glyph must be clipped to this width. Non-ASCII glyphs
+    /// come from a fallback font and cannot be trusted to land on cell bounds.
+    let clipWidth: CGFloat?
+}
+
+/// Splits a row of cells into draw operations.
+///
+/// ASCII runs are merged into a single string because a monospaced face advances
+/// them uniformly. Anything non-ASCII is emitted as its own operation pinned to
+/// its exact cell x: the fallback font a monospaced face uses for CJK or emoji
+/// almost never advances by exactly one or two cells, which would shift every
+/// character after it and make the text drift away from the cursor.
+enum TerminalRowRenderer {
+
+    static func operations(
+        cells: ArraySlice<TermCell>,
+        cellWidth: CGFloat,
+        resolve: (TermCell) -> (font: NSFont, color: NSColor)
+    ) -> [TerminalDrawOp] {
+        var ops: [TerminalDrawOp] = []
+        var col = 0
+        var runStart = 0
+        var runText = ""
+        var runFont: NSFont?
+        var runColor: NSColor?
+        var runFlags: UInt16 = 0
+
+        func flush() {
+            defer { runText = ""; runFont = nil; runColor = nil }
+            guard !runText.isEmpty, let font = runFont, let color = runColor else { return }
+            ops.append(TerminalDrawOp(x: CGFloat(runStart) * cellWidth, text: runText,
+                                      font: font, color: color, flags: runFlags, clipWidth: nil))
+        }
+
+        for cell in cells {
+            if cell.isPad {
+                // The second half of a wide glyph. The glyph's own `col += width`
+                // already advanced past it, so this must not advance again.
+                flush()
+                continue
+            }
+
+            let scalarValue = cell.ch == 0 ? 32 : cell.ch
+            let cellCount = max(1, Int(cell.width))
+            let resolved = resolve(cell)
+
+            if scalarValue >= 0x80 {
+                flush()
+                if let scalar = UnicodeScalar(scalarValue) {
+                    ops.append(TerminalDrawOp(
+                        x: CGFloat(col) * cellWidth,
+                        text: String(Character(scalar)),
+                        font: resolved.font,
+                        color: resolved.color,
+                        flags: cell.flags,
+                        clipWidth: CGFloat(cellCount) * cellWidth
+                    ))
+                }
+                col += cellCount
+                continue
+            }
+
+            if runFont !== resolved.font || runColor != resolved.color || runFlags != cell.flags {
+                flush()
+            }
+            if runText.isEmpty {
+                runStart = col
+                runFont = resolved.font
+                runColor = resolved.color
+                runFlags = cell.flags
+            }
+            if let scalar = UnicodeScalar(scalarValue) {
+                runText.unicodeScalars.append(scalar)
+            } else {
+                runText.append(" ")
+            }
+            col += 1
+        }
+        flush()
+        return ops
+    }
+}
+
 /// Renders a `TerminalEmulator` grid and turns key events into byte sequences.
 ///
 /// The view is the document view of a scroll view and is as tall as the whole
@@ -180,51 +270,33 @@ final class TerminalView: NSView, NSTextInputClient {
             }
         }
 
-        // ---- text runs
-        var runStart = 0
-        var runText = ""
-        var runKey: (NSFont, NSColor, UInt16)?
-        var col = 0
-
-        func flush() {
-            guard !runText.isEmpty, let key = runKey else { runText = ""; return }
-            var attrs: [NSAttributedString.Key: Any] = [.font: key.0, .foregroundColor: key.1]
-            if key.2 & TermCell.flagUnderline != 0 { attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue }
-            if key.2 & TermCell.flagStrike != 0 { attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
-            NSAttributedString(string: runText, attributes: attrs)
-                .draw(at: NSPoint(x: CGFloat(runStart) * cellWidth, y: y + (cellHeight - cellHeight) / 2))
-            runText = ""
-            runKey = nil
+        // ---- text
+        let ops = TerminalRowRenderer.operations(cells: cells, cellWidth: cellWidth) { cell in
+            (self.fontFor(cell), self.resolvedForeground(cell, theme: theme))
         }
-
-        while col < count {
-            let cell = cells[cells.startIndex + col]
-            if cell.isPad {
-                flush()
-                col += 1
-                continue
+        for op in ops {
+            var attrs: [NSAttributedString.Key: Any] = [.font: op.font, .foregroundColor: op.color]
+            if op.flags & TermCell.flagUnderline != 0 {
+                attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
             }
-            let font = fontFor(cell)
-            let color = resolvedForeground(cell, theme: theme)
-            let key = (font, color, cell.flags)
-            if let k = runKey, !(k.0 === key.0 && k.1 == key.1 && k.2 == key.2) {
-                flush()
+            if op.flags & TermCell.flagStrike != 0 {
+                attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
             }
-            if runKey == nil {
-                runKey = key
-                runStart = col
-            }
-            if let scalar = UnicodeScalar(cell.ch == 0 ? 32 : cell.ch) {
-                runText.unicodeScalars.append(scalar)
+            let attributed = NSAttributedString(string: op.text, attributes: attrs)
+            if let clipWidth = op.clipWidth {
+                // 1pt of slack so a slightly wider glyph is not visibly cut.
+                let box = NSRect(x: op.x, y: y, width: clipWidth + 1, height: cellHeight)
+                NSGraphicsContext.saveGraphicsState()
+                NSBezierPath(rect: box).addClip()
+                attributed.draw(at: NSPoint(x: box.minX, y: box.minY))
+                NSGraphicsContext.restoreGraphicsState()
             } else {
-                runText.append(" ")
+                attributed.draw(at: NSPoint(x: op.x, y: y))
             }
-            col += 1
         }
-        flush()
     }
 
-    private func fontFor(_ cell: TermCell) -> NSFont {
+    fileprivate func fontFor(_ cell: TermCell) -> NSFont {
         let bold = cell.flags & TermCell.flagBold != 0
         let italic = cell.flags & TermCell.flagItalic != 0
         if bold && italic { return boldItalicFont }
@@ -233,7 +305,7 @@ final class TerminalView: NSView, NSTextInputClient {
         return regularFont
     }
 
-    private func resolvedForeground(_ cell: TermCell, theme: Theme) -> NSColor {
+    fileprivate func resolvedForeground(_ cell: TermCell, theme: Theme) -> NSColor {
         var fg = TerminalPalette.color(index: cell.fgIndex, rgb: cell.fgRGB, isForeground: true, theme: theme)
             ?? theme.terminalForeground
         var bg = resolvedBackground(cell, theme: theme, defaultBg: theme.terminalBackground)

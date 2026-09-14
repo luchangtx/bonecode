@@ -353,7 +353,10 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
     convenience init() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1380, height: 880),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            // No .fullSizeContentView: the content view would extend under the
+            // title bar and the toolbar's leading items would end up beneath the
+            // close/minimise/zoom buttons.
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )

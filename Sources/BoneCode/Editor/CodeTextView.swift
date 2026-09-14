@@ -140,6 +140,13 @@ final class CodeTextView: NSTextView {
         }
         ps.tabStops = stops
         ps.defaultTabInterval = tabW
+        // Pin the line height. The italic comment font can have slightly
+        // different metrics than the regular face, and a height that changes on
+        // restyle makes the document view resize under the scroll view.
+        let codeFont = ThemeManager.shared.codeFont
+        let lineHeight = ceil(codeFont.ascender - codeFont.descender + codeFont.leading)
+        ps.minimumLineHeight = lineHeight
+        ps.maximumLineHeight = lineHeight
         defaultParagraphStyle = ps
         typingAttributes = baseAttributes()
     }
@@ -270,6 +277,7 @@ final class CodeTextView: NSTextView {
 
     /// Style the visible range from the current token list.
     func applyStyling() {
+        guard !isStyling else { return }        // never re-enter
         guard let ts = textStorage, let lm = layoutManager, let tc = textContainer else { return }
         let theme = ThemeManager.shared.current
         let len = ts.length
@@ -314,14 +322,6 @@ final class CodeTextView: NSTextView {
                 }
             }
             i += 1
-        }
-
-        // bracket match highlight
-        for r in bracketRanges {
-            let inter = NSIntersectionRange(r, charRange)
-            guard inter.length > 0 else { continue }
-            ts.addAttribute(.backgroundColor, value: theme.accentSoft, range: inter)
-            ts.addAttribute(.foregroundColor, value: theme.accent, range: inter)
         }
 
         ts.endEditing()
@@ -397,11 +397,27 @@ final class CodeTextView: NSTextView {
         refreshBracketVisual()
     }
 
+    private var previousBracketRange = NSRange(location: 0, length: 0)
+
+    /// Bracket highlighting uses *temporary* attributes: they affect drawing
+    /// only, so moving the caret never touches the text storage and therefore
+    /// never invalidates layout.
     private func refreshBracketVisual() {
-        // Bracket ranges are drawn as part of applyStyling(); a cheap re-run is
-        // enough because only the visible range is touched.
-        guard let ts = textStorage, ts.length > 0 else { return }
-        applyStyling()
+        guard let lm = layoutManager else { return }
+        if previousBracketRange.length > 0 {
+            lm.removeTemporaryAttribute(.backgroundColor, forCharacterRange: previousBracketRange)
+            previousBracketRange = NSRange(location: 0, length: 0)
+        }
+        guard !bracketRanges.isEmpty else { return }
+        let theme = ThemeManager.shared.current
+        let length = (string as NSString).length
+        for range in bracketRanges where range.location + range.length <= length {
+            lm.addTemporaryAttribute(.backgroundColor, value: theme.accentSoft, forCharacterRange: range)
+        }
+        let start = bracketRanges.map(\.location).min() ?? 0
+        let end = bracketRanges.map { $0.location + $0.length }.max() ?? 0
+        previousBracketRange = NSRange(location: start, length: max(0, end - start))
+        needsDisplay = true
     }
 
     private func findMatch(_ ns: NSString, from index: Int, opener: Character?, closer: Character, forward: Bool) -> Int? {
@@ -922,7 +938,23 @@ final class CodeTextView: NSTextView {
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
-        if !isStyling { applyStyling() }
+        // Never restyle from inside a layout pass. applyStyling() writes to the
+        // text storage, which invalidates layout, which changes this view's
+        // height, which calls setFrameSize again — an infinite loop that shows
+        // up as a permanent spinning cursor. Defer to the next runloop turn.
+        scheduleDeferredStyling()
+    }
+
+    private var deferredStylingScheduled = false
+
+    private func scheduleDeferredStyling() {
+        guard !deferredStylingScheduled else { return }
+        deferredStylingScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.deferredStylingScheduled = false
+            self.applyStyling()
+        }
     }
 
     // MARK: - Drawing

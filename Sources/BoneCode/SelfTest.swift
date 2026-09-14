@@ -39,6 +39,8 @@ enum SelfTest {
         testTerminalWideChars()
         testFuzzyMatch()
         testProjectDetection()
+        testTerminalRowRendering()
+        testEditorLayoutStability()
         testGitLayer()
         testPTYEndToEnd()
         testUILaunch()
@@ -751,6 +753,122 @@ enum SelfTest {
         check("退出码正确传递", exitCode == 7, detail: "实际 \(exitCode)")
     }
 
+    // MARK: - Terminal row rendering
+
+    /// Regression: a run was drawn as one string, so a CJK glyph coming from a
+    /// fallback font (whose advance is not a whole number of cells) shifted
+    /// everything after it, and the text drifted away from the cursor.
+    private static func testTerminalRowRendering() {
+        section("终端行渲染（回归：宽字符导致光标错位）")
+
+        let font = Fonts.code(size: 12)
+        let base = NSColor.black
+        let cellWidth: CGFloat = 8
+
+        let mixed = TerminalEmulator(cols: 20, rows: 4)
+        mixed.feed(Data("中文abc".utf8))
+        let ops = TerminalRowRenderer.operations(cells: mixed.row(0), cellWidth: cellWidth) { _ in
+            (font, base)
+        }
+
+        check("宽字符各自成为一个绘制操作", ops.count >= 3, detail: "\(ops.count) 个操作")
+        guard ops.count >= 3 else { return }
+
+        check("首个宽字符定位在第 0 格", ops[0].x == 0, detail: "x=\(ops[0].x)")
+        check("宽字符带 2 格裁剪宽度", ops[0].clipWidth == cellWidth * 2,
+              detail: "\(ops[0].clipWidth.map(String.init) ?? "nil")")
+        check("第二个宽字符定位在第 2 格", ops[1].x == cellWidth * 2, detail: "x=\(ops[1].x)")
+        check("宽字符之后的 ASCII 从第 4 格开始", ops[2].x == cellWidth * 4, detail: "x=\(ops[2].x)")
+        check("ASCII 被合并成一个 run", ops[2].text.hasPrefix("abc"), detail: "'\(ops[2].text)'")
+        check("ASCII run 不需要裁剪", ops[2].clipWidth == nil)
+        check("宽字符的 x 是格宽整数倍（不会累积漂移）",
+              ops.allSatisfy { $0.x.truncatingRemainder(dividingBy: cellWidth) == 0 })
+
+        let ascii = TerminalEmulator(cols: 20, rows: 4)
+        ascii.feed(Data("hello world".utf8))
+        let asciiOps = TerminalRowRenderer.operations(cells: ascii.row(0), cellWidth: cellWidth) { _ in
+            (font, base)
+        }
+        check("纯 ASCII 只产生一个绘制操作", asciiOps.count == 1, detail: "\(asciiOps.count) 个")
+        check("纯 ASCII run 从第 0 格开始", asciiOps.first?.x == 0)
+
+        let coloured = TerminalEmulator(cols: 20, rows: 4)
+        coloured.feed(Data("ab\u{1B}[31mcd".utf8))
+        let colourOps = TerminalRowRenderer.operations(cells: coloured.row(0), cellWidth: cellWidth) { cell in
+            (font, cell.fgIndex == 1 ? NSColor.red : base)
+        }
+        // Three runs: "ab" (default), "cd" (red), then the trailing blank cells,
+        // which carry the default foreground again.
+        check("颜色变化拆分了 run", colourOps.count >= 2, detail: "\(colourOps.count) 个")
+        if colourOps.count >= 2 {
+            check("默认色 run 内容为 ab", colourOps[0].text.hasPrefix("ab"), detail: "'\(colourOps[0].text)'")
+            check("红色 run 从第 2 格开始", colourOps[1].x == cellWidth * 2,
+                  detail: "x=\(colourOps[1].x)")
+            check("红色 run 内容为 cd", colourOps[1].text.hasPrefix("cd"), detail: "'\(colourOps[1].text)'")
+        }
+    }
+
+    // MARK: - Editor layout stability
+
+    /// Regression: applyStyling() was called from setFrameSize(). It writes to
+    /// the text storage, which invalidates layout, which resizes the text view,
+    /// which calls setFrameSize again — an unbounded loop that froze the app.
+    private static func testEditorLayoutStability() {
+        section("编辑器布局稳定性（回归：无限布局循环）")
+
+        let app = NSApplication.shared
+        app.setActivationPolicy(.prohibited)
+
+        let textView = CodeTextView(frame: NSRect(x: 0, y: 0, width: 900, height: 600))
+        textView.language = LanguageRegistry.language(forID: "swift")
+
+        // Comments take the italic font, which is what used to change the
+        // laid-out height on every restyle.
+        let source = (0..<300).map { i in
+            "// 注释第 \(i) 行 with english text\nlet value\(i) = \"字符串 \(i)\"\n"
+        }.joined()
+        textView.string = source
+        textView.applyTheme()
+        textView.updateParagraphStyle()
+
+        // Tokenizing is asynchronous; let it land before measuring.
+        textView.rehighlight()
+        pumpRunLoop(seconds: 2.0)
+        check("着色后仍有语法 token", !textView.tokens.isEmpty, detail: "\(textView.tokens.count) 个")
+
+        if let lm = textView.layoutManager, let tc = textView.textContainer { lm.ensureLayout(for: tc) }
+
+        let heightBefore = textView.frame.height
+        let widthBefore = textView.frame.width
+
+        // With the bug this recursed until the stack overflowed.
+        for _ in 0..<20 { textView.applyStyling() }
+        if let lm = textView.layoutManager, let tc = textView.textContainer { lm.ensureLayout(for: tc) }
+
+        check("重复着色不改变文本视图高度",
+              abs(textView.frame.height - heightBefore) < 1.0,
+              detail: "\(heightBefore) → \(textView.frame.height)")
+        check("重复着色不改变文本视图宽度",
+              abs(textView.frame.width - widthBefore) < 1.0)
+        check("文本视图高度没有失控增长", textView.frame.height < 5_000_000,
+              detail: "\(textView.frame.height)")
+
+        // The bracket highlight must not touch the text storage any more.
+        let before = textView.textStorage?.length ?? 0
+        textView.setSelectedRange(NSRange(location: 0, length: 0))
+        check("移动光标不改变文本内容长度", (textView.textStorage?.length ?? 0) == before)
+
+        // Line height must be pinned so a font variant cannot resize the layout.
+        if let style = textView.defaultParagraphStyle {
+            check("段落样式固定了行高", style.minimumLineHeight > 0 && style.maximumLineHeight > 0,
+                  detail: "min=\(style.minimumLineHeight) max=\(style.maximumLineHeight)")
+            check("行高上下限一致", abs(style.minimumLineHeight - style.maximumLineHeight) < 0.01)
+        } else {
+            check("段落样式存在", false)
+        }
+
+    }
+
     // MARK: - UI construction
 
     /// Builds the real window hierarchy, opens a workspace and a file, then
@@ -781,6 +899,16 @@ enum SelfTest {
         main.terminalPanel.terminateAll()
         check("AI 面板已加载", main.aiPanel.isViewLoaded)
         check("状态栏已就位", main.statusBar.superview != nil)
+
+        if let window = controller.window {
+            check("窗口未使用 fullSizeContentView（否则工具栏会钻到红绿灯下面）",
+                  !window.styleMask.contains(.fullSizeContentView))
+            if let content = window.contentView {
+                check("内容视图未延伸到标题栏之下",
+                      content.frame.height < window.frame.height,
+                      detail: "content=\(content.frame.height) window=\(window.frame.height)")
+            }
+        }
 
         // ---- open a real workspace
         let fm = FileManager.default
@@ -855,6 +983,95 @@ enum SelfTest {
         // ---- closing the workspace cleans up
         AppState.shared.closeWorkspace()
         check("关闭工作区无异常", AppState.shared.workspaceRoot == nil)
+    }
+
+    // MARK: - Performance diagnosis
+
+    /// Opens every file under `directory` through the real editor path and
+    /// times it. Prints each file name *before* timing so a hang identifies the
+    /// culprit. Run with `--bench [directory]`.
+    static func bench(directory: String) -> Bool {
+        setvbuf(stdout, nil, _IONBF, 0)      // survive a kill
+        print("BoneCode 性能诊断")
+        print("目录: \(directory)")
+        print(String(repeating: "=", count: 92))
+
+        let app = NSApplication.shared
+        app.setActivationPolicy(.prohibited)
+
+        let controller = MainWindowController()
+        let main = controller.mainViewController
+        _ = controller.window
+
+        let fm = FileManager.default
+        let root = URL(fileURLWithPath: directory)
+        var files: [String] = []
+        if let e = fm.enumerator(at: root,
+                                 includingPropertiesForKeys: [.isDirectoryKey],
+                                 options: [.skipsHiddenFiles]) {
+            for case let url as URL in e {
+                let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+                if isDir {
+                    if FileManager.ignoredDirectoryNames.contains(url.lastPathComponent) {
+                        e.skipDescendants()
+                    }
+                    continue
+                }
+                files.append(url.path)
+            }
+        }
+        files.sort()
+
+        print("共 \(files.count) 个文件（已跳过 .git / .build / dist 等）")
+        print(String(repeating: "-", count: 92))
+
+        var slow: [(String, Double, Int)] = []
+        var total: Double = 0
+        var index = 0
+
+        for path in files {
+            index += 1
+            let url = URL(fileURLWithPath: path)
+            let name = url.lastPathComponent
+            let relative = path.hasPrefix(root.path + "/")
+                ? String(path.dropFirst(root.path.count + 1))
+                : path
+            let size = fm.fileSize(at: path)
+            let sizeStr = ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
+            let label = String(format: "%3d  %@", index, relative)
+            print(label.padding(toLength: 58, withPad: " ", startingAt: 0)
+                  + " " + sizeStr.padding(toLength: 9, withPad: " ", startingAt: 0),
+                  terminator: " ")
+            fflush(stdout)
+
+            let start = Date()
+            let editor = main.editorArea.open(url: url)
+            editor.view.layoutSubtreeIfNeeded()
+            if let lm = editor.textView.layoutManager, let tc = editor.textView.textContainer {
+                lm.ensureLayout(for: tc)          // force full layout: hangs show up here
+            }
+            let elapsed = Date().timeIntervalSince(start)
+            total += elapsed
+
+            let chars = (editor.textView.string as NSString).length
+            print(String(format: "%8.1f ms  %9d 字符", elapsed * 1000, chars))
+            fflush(stdout)
+
+            if elapsed > 0.25 { slow.append((relative, elapsed, chars)) }
+            main.editorArea.closeCurrentTab()
+        }
+
+        print(String(repeating: "-", count: 92))
+        print(String(format: "总计 %.2f 秒，平均 %.1f ms", total, total / Double(max(1, files.count)) * 1000))
+        if slow.isEmpty {
+            print("没有超过 250 ms 的文件")
+        } else {
+            print("\n超过 250 ms 的文件（按耗时排序）：")
+            for (path, seconds, chars) in slow.sorted(by: { $0.1 > $1.1 }) {
+                print(String(format: "  %8.1f ms  %9d 字符  %@", seconds * 1000, chars, path))
+            }
+        }
+        return slow.isEmpty
     }
 
     // MARK: - Helpers
