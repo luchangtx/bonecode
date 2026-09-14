@@ -953,6 +953,28 @@ enum SelfTest {
                                                 title: "x.java", subtitle: "测试差异"))
         check("差异标签页已打开", main.editorArea.openFileURLs.count == 2)
 
+        // ---- tab context-menu actions
+        let twoFiles = main.editorArea.openFileURLs.count
+        check("准备阶段有 2 个文件标签", twoFiles == 2, detail: "\(twoFiles) 个")
+
+        main.editorArea.closeTabs(after: 0)
+        check("「关闭右侧标签页」生效", main.editorArea.openFileURLs.count == 1,
+              detail: "剩余 \(main.editorArea.openFileURLs.count) 个")
+
+        _ = main.editorArea.open(url: base.appendingPathComponent("App.vue"))
+        check("重新打开后恢复为 2 个文件标签", main.editorArea.openFileURLs.count == 2,
+              detail: "\(main.editorArea.openFileURLs.count) 个")
+
+        main.editorArea.closeTabs(keeping: 1)
+        check("「关闭其他标签页」生效", main.editorArea.openFileURLs.count == 1,
+              detail: "剩余 \(main.editorArea.openFileURLs.count) 个")
+
+        // ---- running must reveal the terminal: the command really executes even
+        // when the panel is collapsed, which makes the Run button look dead.
+        NotificationCenter.default.post(name: .revealTerminal, object: nil)
+        check("revealTerminal 会展开终端面板", main.isTerminalVisible)
+        check("展开后终端面板视图已构建", main.terminalPanel.isViewLoaded)
+
         // ---- force a full layout pass: layout recursion blows up here
         controller.window?.layoutIfNeeded()
         check("强制布局通过（无递归/无约束冲突）", true)

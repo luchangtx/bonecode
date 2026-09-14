@@ -360,6 +360,10 @@ final class ProjectRunner {
             AppState.shared.editorArea?.saveAll()
         }
 
+        // The terminal panel starts collapsed. Without this the command really
+        // runs but there is nothing on screen, so the button looks dead.
+        NotificationCenter.default.post(name: .revealTerminal, object: nil)
+
         guard !config.command.isEmpty else {
             terminal.newTerminal()
             AppState.shared.postStatus("已打开终端")
@@ -370,7 +374,7 @@ final class ProjectRunner {
                             cwd: config.workingDirectory,
                             title: config.name,
                             workingDirectory: config.workingDirectory)
-        AppState.shared.postStatus("正在运行：\(config.name)")
+        AppState.shared.postStatus("已启动「\(config.name)」，输出在下方终端面板")
 
         if config.autoOpenBrowser || config.detectedPort != nil {
             startPortWatch(port: config.detectedPort, autoOpen: config.autoOpenBrowser)
@@ -378,8 +382,10 @@ final class ProjectRunner {
     }
 
     func runDefault() {
+        NotificationCenter.default.post(name: .revealTerminal, object: nil)
         guard let first = configs.first else {
             AppState.shared.terminalPanel?.newTerminal()
+            AppState.shared.postStatus("未检测到运行配置，已打开终端")
             return
         }
         run(first)

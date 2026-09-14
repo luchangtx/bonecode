@@ -246,6 +246,9 @@ extension Notification.Name {
 
     // Panels
     static let toggleTerminal = Notification.Name("BoneCode.toggleTerminal")
+    /// Expand the terminal panel without creating a session. Used before a run
+    /// so the new session is sized against the real panel.
+    static let revealTerminal = Notification.Name("BoneCode.revealTerminal")
     static let toggleGitPanel = Notification.Name("BoneCode.toggleGitPanel")
     static let toggleAIPanel = Notification.Name("BoneCode.toggleAIPanel")
     static let toggleSidebar = Notification.Name("BoneCode.toggleSidebar")

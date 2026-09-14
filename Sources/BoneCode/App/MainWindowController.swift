@@ -181,6 +181,7 @@ final class MainViewController: NSViewController {
         center.addObserver(self, selector: #selector(handleNewFile), name: .welcomeNewFile, object: nil)
         center.addObserver(self, selector: #selector(handleOpenPath(_:)), name: .welcomeOpenPath, object: nil)
         center.addObserver(self, selector: #selector(handleToggleTerminal(_:)), name: .toggleTerminal, object: nil)
+        center.addObserver(self, selector: #selector(handleRevealTerminal), name: .revealTerminal, object: nil)
         center.addObserver(self, selector: #selector(handleToggleAI), name: .toggleAIPanel, object: nil)
         center.addObserver(self, selector: #selector(handleToggleSidebar), name: .toggleSidebar, object: nil)
         center.addObserver(self, selector: #selector(handleStatus(_:)), name: .statusMessage, object: nil)
@@ -262,6 +263,15 @@ final class MainViewController: NSViewController {
         }
     }
 
+    /// Expand the terminal without animation and lay it out immediately, so the
+    /// session created right afterwards measures the real panel size.
+    @objc private func handleRevealTerminal() {
+        if terminalItem.isCollapsed {
+            terminalItem.isCollapsed = false
+        }
+        view.layoutSubtreeIfNeeded()
+    }
+
     @objc private func handleToggleAI() {
         aiItem.animator().isCollapsed.toggle()
         if !aiItem.isCollapsed { aiPanel.focusInput() }
@@ -340,6 +350,9 @@ final class MainViewController: NSViewController {
     }
 
     func saveAll() { editorArea.saveAll() }
+
+    /// Whether the terminal panel is currently expanded.
+    var isTerminalVisible: Bool { !terminalItem.isCollapsed }
 
     func handleNewFileAction() { handleNewFile() }
 }

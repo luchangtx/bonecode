@@ -387,5 +387,10 @@ private final class RunConfigRowView: NSView {
         addTrackingArea(NSTrackingArea(rect: bounds,
                                        options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
                                        owner: self, userInfo: nil))
+        window?.invalidateCursorRects(for: self)
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
     }
 }

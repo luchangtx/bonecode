@@ -2,9 +2,22 @@ import AppKit
 
 // MARK: - Tab bar
 
+/// Commands offered by the tab context menu.
+enum EditorTabAction {
+    case close
+    case closeOthers
+    case closeToRight
+    case closeAll
+    case copyPath
+    case revealInFinder
+    case reloadFromDisk
+    case openInTerminal
+}
+
 protocol EditorTabBarDelegate: AnyObject {
     func tabBar(_ bar: EditorTabBar, didSelect index: Int)
     func tabBar(_ bar: EditorTabBar, didClose index: Int)
+    func tabBar(_ bar: EditorTabBar, perform action: EditorTabAction, on index: Int)
 }
 
 /// Hand-drawn tab strip. A stack of NSButtons would need a lot of layout code
@@ -241,6 +254,51 @@ final class EditorTabBar: NSView {
         scrollOffset -= event.scrollingDeltaX + event.scrollingDeltaY
         clampScroll()
         needsDisplay = true
+    }
+
+    // MARK: - Context menu
+
+    private var clickedIndex = -1
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let index = index(at: point) else { return nil }
+        clickedIndex = index
+        if index != selectedIndex {
+            delegate?.tabBar(self, didSelect: index)
+        }
+
+        let menu = NSMenu()
+        let hasOthers = tabs.count > 1
+        let hasRight = index < tabs.count - 1
+        let entries: [(String, EditorTabAction, Bool)] = [
+            ("关闭", .close, true),
+            ("关闭其他标签页", .closeOthers, hasOthers),
+            ("关闭右侧标签页", .closeToRight, hasRight),
+            ("关闭所有标签页", .closeAll, hasOthers),
+            ("", .close, false),
+            ("复制完整路径", .copyPath, true),
+            ("在 Finder 中显示", .revealInFinder, true),
+            ("重新从磁盘加载", .reloadFromDisk, true),
+            ("在终端中打开所在目录", .openInTerminal, true)
+        ]
+        for (title, action, enabled) in entries {
+            if title.isEmpty {
+                menu.addItem(.separator())
+                continue
+            }
+            let item = NSMenuItem(title: title, action: #selector(menuAction(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = action
+            item.isEnabled = enabled
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    @objc private func menuAction(_ sender: NSMenuItem) {
+        guard let action = sender.representedObject as? EditorTabAction, clickedIndex >= 0 else { return }
+        delegate?.tabBar(self, perform: action, on: clickedIndex)
     }
 }
 
@@ -555,8 +613,92 @@ final class EditorAreaController: NSViewController {
 }
 
 extension EditorAreaController: EditorTabBarDelegate {
+
     func tabBar(_ bar: EditorTabBar, didSelect index: Int) { select(index) }
+
     func tabBar(_ bar: EditorTabBar, didClose index: Int) { closeTab(at: index) }
+
+    func tabBar(_ bar: EditorTabBar, perform action: EditorTabAction, on index: Int) {
+        guard index >= 0, index < contents.count else { return }
+        switch action {
+        case .close:
+            closeTab(at: index)
+        case .closeOthers:
+            closeTabs(keeping: index)
+        case .closeToRight:
+            closeTabs(after: index)
+        case .closeAll:
+            closeAllTabs()
+        case .copyPath:
+            guard let url = contents[index].tabURL else { return }
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(url.path, forType: .string)
+            AppState.shared.postStatus("已复制路径")
+        case .revealInFinder:
+            guard let url = contents[index].tabURL else { return }
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        case .reloadFromDisk:
+            (contents[index] as? CodeEditorViewController)?.reloadFromDisk()
+            AppState.shared.postStatus("已从磁盘重新加载")
+        case .openInTerminal:
+            guard let url = contents[index].tabURL else { return }
+            NotificationCenter.default.post(name: .toggleTerminal, object: "show")
+            NotificationCenter.default.post(name: .terminalSendText,
+                                            object: "cd \"\(url.deletingLastPathComponent().path)\"\n")
+        }
+    }
+
+    /// Close every tab except `index`.
+    func closeTabs(keeping index: Int) {
+        guard contents.count > 1, index >= 0, index < contents.count else { return }
+        let doomed = contents.enumerated().filter { $0.offset != index }.map { $0.element }
+        guard confirmClosing(doomed) else { return }
+        let kept = contents[index]
+        for content in doomed { detach(content) }
+        contents = [kept]
+        currentIndex = 0
+        select(0)
+    }
+
+    /// Close every tab to the right of `index`.
+    func closeTabs(after index: Int) {
+        guard index >= 0, index < contents.count - 1 else { return }
+        let doomed = Array(contents[(index + 1)...])
+        guard confirmClosing(doomed) else { return }
+        for content in doomed { detach(content) }
+        contents.removeSubrange((index + 1)...)
+        if currentIndex > index { currentIndex = index }
+        select(min(currentIndex, contents.count - 1))
+    }
+
+    private func detach(_ content: EditorTabContent) {
+        guard let vc = content as? NSViewController else { return }
+        vc.view.removeFromSuperview()
+        vc.removeFromParent()
+    }
+
+    /// One prompt for the whole batch, so a partial close cannot happen.
+    private func confirmClosing(_ doomed: [EditorTabContent]) -> Bool {
+        let dirty = doomed.filter { $0.tabIsDirty }
+        guard !dirty.isEmpty else { return true }
+
+        let alert = NSAlert()
+        alert.messageText = "有 \(dirty.count) 个文件尚未保存"
+        alert.informativeText = dirty.map { "• \($0.tabTitle)" }.joined(separator: "\n")
+        alert.addButton(withTitle: "全部保存")
+        alert.addButton(withTitle: "放弃修改")
+        alert.addButton(withTitle: "取消")
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            for content in dirty where !content.saveIfNeeded() { return false }
+            return true
+        case .alertSecondButtonReturn:
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 // MARK: - Read-only text tab
@@ -625,6 +767,53 @@ final class TextTabViewController: NSViewController, EditorTabContent {
             scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor)
         ])
         view = container
+    }
+}
+
+// MARK: - Hoverable list row
+
+/// A borderless button gives no affordance whatsoever — users cannot tell it is
+/// interactive. This one highlights on hover and shows a pointing-hand cursor.
+final class HoverRowButton: NSButton {
+
+    private var trackingArea: NSTrackingArea?
+    private var isHovered = false {
+        didSet {
+            guard isHovered != oldValue else { return }
+            layer?.backgroundColor = isHovered
+                ? ThemeManager.shared.current.hover.cgColor
+                : NSColor.clear.cgColor
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        isBordered = false
+        bezelStyle = .inline
+        alignment = .left
+        wantsLayer = true
+        layer?.cornerRadius = 6
+        layer?.masksToBounds = true
+    }
+
+    required init?(coder: NSCoder) { fatalError("not supported") }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+        window?.invalidateCursorRects(for: self)
+    }
+
+    override func mouseEntered(with event: NSEvent) { isHovered = true }
+    override func mouseExited(with event: NSEvent) { isHovered = false }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
     }
 }
 
@@ -716,7 +905,7 @@ final class WelcomeView: NSView {
             column.centerXAnchor.constraint(equalTo: centerXAnchor),
             column.centerYAnchor.constraint(equalTo: centerYAnchor),
             buttonRow.widthAnchor.constraint(equalToConstant: 300),
-            recentStack.widthAnchor.constraint(lessThanOrEqualToConstant: 420)
+            recentStack.widthAnchor.constraint(equalToConstant: 360)
         ])
 
         applyTheme()
@@ -727,7 +916,10 @@ final class WelcomeView: NSView {
 
     deinit { NotificationCenter.default.removeObserver(self) }
 
-    @objc private func themeChanged() { applyTheme() }
+    @objc private func themeChanged() {
+        applyTheme()
+        reloadRecent()      // rows are rebuilt with theme colours
+    }
 
     func applyTheme() {
         let theme = ThemeManager.shared.current
@@ -752,15 +944,34 @@ final class WelcomeView: NSView {
             recentStack.addArrangedSubview(empty)
             return
         }
+        let theme = ThemeManager.shared.current
         for item in recents {
-            let button = NSButton(title: "  " + item.display, target: self, action: #selector(recentClicked(_:)))
-            button.bezelStyle = .inline
-            button.isBordered = false
-            button.font = Fonts.ui(size: 11.5)
-            button.contentTintColor = ThemeManager.shared.current.accent
+            let button = HoverRowButton(title: "", target: self, action: #selector(recentClicked(_:)))
             button.identifier = NSUserInterfaceItemIdentifier(item.path)
-            button.alignment = .left
+            button.toolTip = item.path + "\n点击打开"
+            button.image = Icons.symbol(item.isDirectory ? "folder" : "doc.text", size: 11)
+            button.imagePosition = .imageLeading
+            button.contentTintColor = item.isDirectory ? theme.accent : theme.secondaryText
+
+            let name = (item.path as NSString).lastPathComponent
+            let parent = (item.path as NSString).deletingLastPathComponent
+                .abbreviatedPath(maxComponents: 2)
+            let title = NSMutableAttributedString(string: name + "   ", attributes: [
+                .font: Fonts.ui(size: 11.5),
+                .foregroundColor: theme.text
+            ])
+            title.append(NSAttributedString(string: parent, attributes: [
+                .font: Fonts.ui(size: 10),
+                .foregroundColor: theme.tertiaryText
+            ]))
+            button.attributedTitle = title
+
+            button.translatesAutoresizingMaskIntoConstraints = false
             recentStack.addArrangedSubview(button)
+            NSLayoutConstraint.activate([
+                button.widthAnchor.constraint(equalTo: recentStack.widthAnchor),
+                button.heightAnchor.constraint(equalToConstant: 24)
+            ])
         }
     }
 
