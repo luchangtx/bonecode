@@ -377,8 +377,23 @@ final class TerminalPanelController: NSViewController {
         startShell(for: session)
     }
 
+    private var interruptRequestedAt: Date?
+
+    /// First press sends Ctrl-C; a second press within five seconds escalates to
+    /// SIGKILL, since plenty of processes ignore the interrupt.
     @objc func interruptTerminal() {
-        activeSession?.pty?.sendInterrupt()
+        guard let session = activeSession else { return }
+
+        if let requested = interruptRequestedAt, Date().timeIntervalSince(requested) < 5 {
+            interruptRequestedAt = nil
+            session.pty?.forceKill()
+            AppState.shared.postStatus("已强制结束进程 (SIGKILL)")
+            return
+        }
+
+        interruptRequestedAt = Date()
+        session.pty?.sendInterrupt()
+        AppState.shared.postStatus("已发送 Ctrl-C；若仍在运行，请再点一次强制结束")
     }
 
     @objc func closeTerminal() {
@@ -409,8 +424,14 @@ final class TerminalPanelController: NSViewController {
         }
     }
 
+    /// Send Ctrl-C to the foreground job.
     func stopActiveProcess() {
         activeSession?.pty?.sendInterrupt()
+    }
+
+    /// Escalate when the job ignores SIGINT.
+    func forceKillActiveProcess() {
+        activeSession?.pty?.forceKill()
     }
 
     /// Run a command in a fresh terminal tab, creating the panel content if needed.

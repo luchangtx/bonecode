@@ -767,6 +767,20 @@ enum SelfTest {
         check("resize 不抛异常且记录新尺寸", pty.cols == 120 && pty.rows == 30,
               detail: "\(pty.cols)x\(pty.rows)")
 
+        // Ctrl-C must interrupt the *foreground job*, not just poke the shell.
+        // The shell has job control, so the running command is in its own process
+        // group; only the tty line discipline can deliver SIGINT to it.
+        pty.write("sleep 30\n")
+        pumpRunLoop(seconds: 1.2)
+        pty.sendInterrupt()
+        pumpRunLoop(seconds: 1.5)
+        pty.write("printf 'AFTER_INTERRUPT\\n'\n")
+        pumpRunLoop(seconds: 1.5)
+        let afterInterrupt = emulator.recentText(lines: 24)
+        check("Ctrl-C 能中断前台进程（shell 重新接受命令）",
+              afterInterrupt.contains("AFTER_INTERRUPT"),
+              detail: afterInterrupt.suffix(80).description)
+
         // exit propagation
         pty.write("exit 7\n")
         pumpRunLoop(seconds: 3)

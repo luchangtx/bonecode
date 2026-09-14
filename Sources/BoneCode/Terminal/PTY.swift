@@ -227,9 +227,22 @@ final class PTY {
     }
 
     /// Interrupt the foreground job (Ctrl-C).
+    ///
+    /// Writing the INTR character is what actually works. An interactive shell
+    /// with job control puts each foreground command in its *own* process group,
+    /// so `kill(-shellPID, SIGINT)` never reaches `npm`, `mvn` or whatever is
+    /// actually running. The tty line discipline delivers SIGINT to the
+    /// foreground process group for us.
     func sendInterrupt() {
+        guard masterFD >= 0 else { return }
+        write(Data([0x03]))
+    }
+
+    /// Escalate to SIGKILL for a job that ignores SIGINT.
+    func forceKill() {
         guard pid > 0 else { return }
-        kill(-pid, SIGINT)
+        kill(-pid, SIGKILL)
+        kill(pid, SIGKILL)
     }
 
     func terminate() {

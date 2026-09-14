@@ -402,11 +402,26 @@ final class ProjectRunner {
         run(first)
     }
 
+    /// First press sends Ctrl-C. A second press within five seconds escalates to
+    /// SIGKILL, because plenty of processes (dev servers, Maven) ignore or
+    /// swallow the interrupt.
     func stop() {
         stopPortWatch()
-        AppState.shared.terminalPanel?.stopActiveProcess()
-        AppState.shared.postStatus("已发送中断信号 (Ctrl-C)")
+        guard let terminal = AppState.shared.terminalPanel else { return }
+
+        if let requested = stopRequestedAt, Date().timeIntervalSince(requested) < 5 {
+            stopRequestedAt = nil
+            terminal.forceKillActiveProcess()
+            AppState.shared.postStatus("已强制结束进程 (SIGKILL)")
+            return
+        }
+
+        stopRequestedAt = Date()
+        terminal.stopActiveProcess()
+        AppState.shared.postStatus("已发送 Ctrl-C；若进程仍在运行，请再点一次强制结束")
     }
+
+    private var stopRequestedAt: Date?
 
     private func setRunning(_ value: Bool) {
         guard isRunning != value else { return }
