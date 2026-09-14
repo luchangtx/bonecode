@@ -77,6 +77,7 @@ final class AIPanelViewController: NSViewController {
             button.bezelStyle = .rounded
             button.controlSize = .small
             button.font = Fonts.ui(size: 10)
+            button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
             quickStack.addArrangedSubview(button)
         }
 
@@ -152,6 +153,9 @@ final class AIPanelViewController: NSViewController {
 
         inputHint.font = Fonts.ui(size: 10)
         inputHint.textColor = ThemeManager.shared.current.tertiaryText
+        inputHint.lineBreakMode = .byTruncatingTail
+        // Must be able to shrink, otherwise it sets a hard floor on the panel width.
+        inputHint.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         inputHint.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(inputHint)
 
@@ -208,11 +212,19 @@ final class AIPanelViewController: NSViewController {
         renderIntro()
         NotificationCenter.default.addObserver(self, selector: #selector(themeChanged),
                                                name: .themeDidChange, object: nil)
+        // The API key is read off the main thread; refresh once it lands.
+        NotificationCenter.default.addObserver(self, selector: #selector(configurationChanged),
+                                               name: .aiConfigurationChanged, object: nil)
     }
 
     deinit { NotificationCenter.default.removeObserver(self) }
 
     @objc private func themeChanged() { applyTheme(); rerenderTranscript() }
+
+    @objc private func configurationChanged() {
+        refreshModelLabel()
+        if history.isEmpty { renderIntro() }
+    }
 
     private func applyTheme() {
         let theme = ThemeManager.shared.current
@@ -653,7 +665,7 @@ final class AIPanelViewController: NSViewController {
         let modelLabel = NSTextField(labelWithString: "模型名称")
         let modelField = NSTextField(string: AIService.shared.model)
         let keyLabel = NSTextField(labelWithString: "API Key")
-        let keyField = NSSecureTextField(string: AIService.shared.apiKey ?? "")
+        let keyField = NSSecureTextField(string: AIService.shared.apiKey ?? "")   // cache, not keychain
         let tempLabel = NSTextField(labelWithString: "温度")
         let tempField = NSTextField(string: String(format: "%.1f", AIService.shared.temperature))
 

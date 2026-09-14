@@ -98,10 +98,15 @@ cd BoneCode
 编辑器、Git、终端这些核心引擎可以在无界面环境下自测：
 
 ```bash
-./dist/BoneCode.app/Contents/MacOS/BoneCode --selftest
+./dist/BoneCode.app/Contents/MacOS/BoneCode --selftest   # 引擎（不建窗口，稳定）
+./dist/BoneCode.app/Contents/MacOS/BoneCode --uitest     # 界面（建真实窗口，需图形环境）
+./dist/BoneCode.app/Contents/MacOS/BoneCode --bench DIR  # 逐文件打开计时，查卡顿
 ```
 
-覆盖 150 项断言：语法高亮（含 Vue 混合语法）、行内词级 diff、Diff 解析、
+界面自检会创建真实 NSWindow。在无显示环境（SSH / 受限沙箱）下 AppKit 内部可能
+停住，所以它单独成一个模式并带 90 秒看门狗——卡住会明确报超时，而不是无限等待。
+
+覆盖 154 项断言：语法高亮（含 Vue 混合语法）、行内词级 diff、Diff 解析、
 补全排序、终端转义序列解析（含 256 色/真彩色/备用屏/宽字符）、
 项目类型探测、真实 Git 仓库操作（提交/暂存/日志/图谱/分支/贮藏/cherry-pick/
 revert/reset/撤销提交）、**真实 PTY 端到端**（分配 PTY、shell 交互、

@@ -107,18 +107,26 @@ final class MainViewController: NSViewController {
         // ---- outer: sidebar | center | ai
         outerSplit.splitView.isVertical = true
         outerSplit.splitView.dividerStyle = .thin
-        sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebar)
+        // Deliberately NOT sidebarWithViewController: — that wraps the view in a
+        // vibrant NSVisualEffectView whose material follows the system appearance
+        // rather than our theme, which leaves the panel looking unthemed. A plain
+        // item lets us paint an opaque background we control.
+        // Deliberately NOT sidebarWithViewController: — that wraps the view in a
+        // vibrant NSVisualEffectView whose material follows the *system*
+        // appearance rather than our theme, leaving the panel looking unthemed.
+        // A plain item lets us paint an opaque background we control.
+        sidebarItem = NSSplitViewItem(viewController: sidebar)
         sidebarItem.minimumThickness = Metrics.sidebarMinWidth
-        sidebarItem.maximumThickness = 460
+        sidebarItem.maximumThickness = 420
         sidebarItem.canCollapse = true
         sidebarItem.holdingPriority = .defaultLow
 
         let centerItem = NSSplitViewItem(viewController: centerSplit)
-        centerItem.minimumThickness = 320
+        centerItem.minimumThickness = 280
 
         aiItem = NSSplitViewItem(viewController: aiPanel)
-        aiItem.minimumThickness = 280
-        aiItem.maximumThickness = 560
+        aiItem.minimumThickness = Metrics.aiPanelMinWidth
+        aiItem.maximumThickness = 520
         aiItem.canCollapse = true
         aiItem.holdingPriority = .defaultHigh
 
@@ -146,6 +154,7 @@ final class MainViewController: NSViewController {
 
         view = root
         wire()
+        hardenPanelBackgrounds()
     }
 
     override func viewDidAppear() {
@@ -299,6 +308,35 @@ final class MainViewController: NSViewController {
         statusBar.applyTheme()
         refreshStatusBar()
         updateRunControls()
+        hardenPanelBackgrounds()
+    }
+
+    /// Re-assert an opaque background on every panel root. Belt and braces: the
+    /// controllers each react to the theme too, but a single missed surface shows
+    /// up as an unthemed stripe.
+    private func hardenPanelBackgrounds() {
+        let theme = ThemeManager.shared.current
+        var surfaces: [(NSView, NSColor)] = [
+            (sidebar.view, theme.sidebarBackground),
+            (editorArea.view, theme.editorBackground),
+            (aiPanel.view, theme.panelBackground)
+        ]
+        // Only touch the terminal panel when its view already exists. The panel
+        // starts collapsed, and forcing a collapsed item's view to load from
+        // inside another controller's loadView deadlocks.
+        if terminalPanel.isViewLoaded {
+            surfaces.append((terminalPanel.view, theme.terminalBackground))
+        }
+        for (view, color) in surfaces {
+            view.wantsLayer = true
+            view.layer?.backgroundColor = color.cgColor
+            // Strip AppKit's wallpaper-sampling sidebar material, or the panel
+            // ignores the theme no matter what colour we set.
+            Vibrancy.neutralize(in: view, background: color)
+        }
+        view.wantsLayer = true
+        view.layer?.backgroundColor = theme.windowBackground.cgColor
+        view.needsDisplay = true
     }
 
     @objc private func handleActiveEditor() {
@@ -383,6 +421,12 @@ final class MainViewController: NSViewController {
     /// Whether the terminal panel is currently expanded.
     var isTerminalVisible: Bool { !terminalItem.isCollapsed }
 
+    /// Minimum widths the split view items enforce. Exposed so the self-test can
+    /// assert the dividers remain draggable.
+    var panelMinimumWidths: (sidebar: CGFloat, center: CGFloat, ai: CGFloat) {
+        (sidebarItem.minimumThickness, 280, aiItem.minimumThickness)
+    }
+
     func handleNewFileAction() { handleNewFile() }
 }
 
@@ -405,7 +449,9 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
         window.title = "BoneCode"
         window.titlebarAppearsTransparent = false
         window.toolbarStyle = .unified
-        window.minSize = NSSize(width: 900, height: 560)
+        // Must not exceed the sum of the split view item minimums, or the split
+        // view is forced to violate them and the dividers stop responding.
+        window.minSize = NSSize(width: 820, height: 520)
         window.tabbingMode = .disallowed
         window.setFrameAutosaveName("BoneCodeMainWindow")
         window.center()

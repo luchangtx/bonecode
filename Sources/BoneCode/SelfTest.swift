@@ -25,8 +25,9 @@ enum SelfTest {
         print("\n\u{001B}[1m\(title)\u{001B}[0m")
     }
 
-    static func run() -> Bool {
-        print("BoneCode 自检 (macOS \(ProcessInfo.processInfo.operatingSystemVersionString))")
+    static func runEngines() -> Bool {
+        setvbuf(stdout, nil, _IONBF, 0)      // keep progress visible if we hang
+        print("BoneCode 引擎自检 (macOS \(ProcessInfo.processInfo.operatingSystemVersionString))")
         print(String(repeating: "=", count: 62))
 
         testLanguageRegistry()
@@ -41,10 +42,30 @@ enum SelfTest {
         testProjectDetection()
         testTerminalRowRendering()
         testEditorLayoutStability()
+        testPanelTheming()
         testGitLayer()
         testPTYEndToEnd()
-        testUILaunch()
 
+        return finish()
+    }
+
+    /// The UI smoke test builds a real NSWindow. Creating windows in a headless
+    /// process can stall on AppKit internals, so it runs in its own mode with a
+    /// watchdog (`--uitest`) and never blocks the engine suite.
+    static func runUI() -> Bool {
+        setvbuf(stdout, nil, _IONBF, 0)
+        print("BoneCode 界面自检")
+        print(String(repeating: "=", count: 62))
+        testUILaunch()
+        return finish()
+    }
+
+    /// Convenience: both suites. May hang on the UI part in a headless session.
+    static func run() -> Bool {
+        runEngines() && runUI()
+    }
+
+    private static func finish() -> Bool {
         print(String(repeating: "=", count: 62))
         print("通过 \(passed) 项，失败 \(failed) 项")
         return failed == 0
@@ -869,6 +890,63 @@ enum SelfTest {
 
     }
 
+    // MARK: - Panel theming
+
+    /// Verifies every panel root actually repaints on a theme switch.
+    ///
+    /// Deliberately builds the controllers *without* a window: creating an
+    /// NSWindow stalls on AppKit internals in a headless process, but plain view
+    /// hierarchies load fine — and a panel whose background never gets set shows
+    /// whatever is behind it, which is exactly the "unthemed stripe" symptom.
+    private static func testPanelTheming() {
+        section("面板主题跟随（不依赖窗口）")
+
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+
+        let panels: [(String, NSViewController, (Theme) -> NSColor)] = [
+            ("侧边栏", SidebarViewController(), { $0.sidebarBackground }),
+            ("编辑器区域", EditorAreaController(), { $0.editorBackground }),
+            ("AI 面板", AIPanelViewController(), { $0.panelBackground })
+        ]
+
+        for (name, viewController, expectedColor) in panels {
+            _ = viewController.view
+            viewController.view.layoutSubtreeIfNeeded()
+            check("\(name) 根视图设置了背景色", viewController.view.layer?.backgroundColor != nil)
+
+            for dark in [false, true] {
+                ThemeManager.shared.apply(dark ? .dark : .light)
+                let expected = expectedColor(ThemeManager.shared.current)
+                guard let cg = viewController.view.layer?.backgroundColor,
+                      let actual = NSColor(cgColor: cg)?.usingColorSpace(.sRGB),
+                      let want = expected.usingColorSpace(.sRGB) else {
+                    check("\(name) \(dark ? "深色" : "浅色")主题背景可读取", false)
+                    continue
+                }
+                let delta = abs(actual.redComponent - want.redComponent)
+                    + abs(actual.greenComponent - want.greenComponent)
+                    + abs(actual.blueComponent - want.blueComponent)
+                let brightness = (actual.redComponent + actual.greenComponent + actual.blueComponent) / 3
+                check("\(name) \(dark ? "深色" : "浅色")主题背景正确",
+                      delta < 0.02 && (dark ? brightness < 0.55 : brightness > 0.55),
+                      detail: String(format: "亮度 %.2f，与主题色差 %.3f", brightness, delta))
+            }
+        }
+
+        // AppKit injects a wallpaper-sampling layer (material .sidebar,
+        // .behindWindow blending) into scroll views inside a sidebar. It ignores
+        // the theme entirely — this is the "panel didn't follow the theme" bug.
+        for (name, viewController, color) in panels {
+            Vibrancy.neutralize(in: viewController.view, background: color(ThemeManager.shared.current))
+            check("\(name) 没有采样桌面壁纸的毛玻璃层",
+                  !Vibrancy.hasBehindWindowEffect(viewController.view),
+                  detail: describeBehindWindowEffects(viewController.view))
+        }
+
+        ThemeManager.shared.apply(.light)
+    }
+
     // MARK: - UI construction
 
     /// Builds the real window hierarchy, opens a workspace and a file, then
@@ -1020,6 +1098,20 @@ enum SelfTest {
         controller.window?.layoutIfNeeded()
         check("强制布局通过（无递归/无约束冲突）", true)
 
+        // ---- panel minimum sizes. A panel whose floor is too high cannot be
+        // dragged narrower, which reads as "the divider is broken". The sum of
+        // the floors must also fit inside the window's minimum width, or the
+        // split view is forced to violate them.
+        let minimums = main.panelMinimumWidths
+        let windowMinimum = controller.window?.minSize.width ?? 0
+        print(String(format: "    面板最小宽度：侧边栏 %.0f / 中央 %.0f / AI %.0f；窗口最小 %.0f",
+                     minimums.sidebar, minimums.center, minimums.ai, windowMinimum))
+        check("侧边栏最小宽度 ≤ 180", minimums.sidebar <= 180, detail: "\(minimums.sidebar) pt")
+        check("AI 面板最小宽度 ≤ 240", minimums.ai <= 240, detail: "\(minimums.ai) pt")
+        let floors = minimums.sidebar + minimums.center + minimums.ai
+        check("面板最小宽度之和不超过窗口最小宽度（分栏可拖动）",
+              windowMinimum >= floors, detail: "面板合计 \(floors) pt，窗口最小 \(windowMinimum) pt")
+
         // ---- sidebar sections all render
         main.sidebar.select(1)
         check("切换到 Git 面板无异常", main.sidebar.gitPanel.isViewLoaded)
@@ -1028,9 +1120,54 @@ enum SelfTest {
         main.sidebar.select(0)
         check("切回项目面板无异常", main.sidebar.fileTree.isViewLoaded)
 
-        // ---- theme flip must not break anything
-        ThemeManager.shared.apply(.dark)
-        check("切换到深色主题无异常", ThemeManager.shared.current.isDark)
+        // ---- theme audit: verify every surface actually follows the theme.
+        // A vibrant sidebar wrapper silently ignores our colours, and a view
+        // whose background was never set shows whatever is behind it.
+        controller.window?.setContentSize(NSSize(width: 1280, height: 820))
+        controller.window?.layoutIfNeeded()
+        if let content = controller.window?.contentView {
+            func audit(_ label: String, dark: Bool) {
+                ThemeManager.shared.apply(dark ? .dark : .light)
+                content.layoutSubtreeIfNeeded()
+
+                if let window = controller.window {
+                    let isDark = window.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+                    check("\(label)：窗口外观跟随主题", isDark == dark, detail: isDark ? "dark" : "light")
+                }
+
+                for (name, view) in [("侧边栏", main.sidebar.view),
+                                     ("编辑器区域", main.editorArea.view),
+                                     ("AI 面板", main.aiPanel.view)] {
+                    guard let cg = view.layer?.backgroundColor, let color = NSColor(cgColor: cg)?
+                        .usingColorSpace(.sRGB) else {
+                        check("\(label)：\(name) 设置了背景色", false)
+                        continue
+                    }
+                    let brightness = (color.redComponent + color.greenComponent + color.blueComponent) / 3
+                    check("\(label)：\(name) 背景色跟随主题", dark ? brightness < 0.55 : brightness > 0.55,
+                          detail: String(format: "亮度 %.2f（期望 %@）", brightness, dark ? "< 0.55" : "> 0.55"))
+                }
+
+                var effects: [String] = []
+                Self.collectVisualEffectViews(content, path: "content", into: &effects)
+                if !effects.isEmpty {
+                    print("      视觉特效视图: \(effects.joined(separator: " | "))")
+                }
+                check("\(label)：没有会覆盖主题的视觉特效视图", effects.isEmpty,
+                      detail: effects.joined(separator: " | "))
+
+                // Surfaces that never got a background would show through.
+                var unbacked: [String] = []
+                Self.collectUnbackedSurfaces(content, path: "content", into: &unbacked)
+                if !unbacked.isEmpty {
+                    print("      未设置背景的容器: \(unbacked.prefix(6).joined(separator: ", "))")
+                }
+            }
+
+            audit("浅色", dark: false)
+            audit("深色", dark: true)
+        }
+
         ThemeManager.shared.apply(.light)
         check("切回浅色主题无异常", !ThemeManager.shared.current.isDark)
 
@@ -1135,6 +1272,42 @@ enum SelfTest {
             }
         }
         return slow.isEmpty
+    }
+
+    /// Containers that host visible content but never got a background colour.
+    private static func collectUnbackedSurfaces(_ view: NSView, path: String, into out: inout [String]) {
+        let interesting = ["SidebarViewController", "AIPanelViewController", "EditorAreaController",
+                           "TerminalPanelController", "GitPanelViewController", "WelcomeView",
+                           "MainViewController", "NSClipView", "NSScrollView"]
+        let name = String(describing: type(of: view))
+        if interesting.contains(name), view.layer?.backgroundColor == nil {
+            out.append("\(name)@\(path)")
+        }
+        for sub in view.subviews {
+            collectUnbackedSurfaces(sub, path: "\(path)/\(name)", into: &out)
+        }
+    }
+
+    private static func describeBehindWindowEffects(_ view: NSView, path: String = "root") -> String {
+        var found: [String] = []
+        func walk(_ v: NSView, _ p: String) {
+            if let effect = v as? NSVisualEffectView,
+               effect.material == .sidebar || effect.blendingMode == .behindWindow {
+                found.append("\(p)[material=\(effect.material.rawValue) blending=\(effect.blendingMode.rawValue)]")
+            }
+            for sub in v.subviews { walk(sub, "\(p)/\(type(of: sub))") }
+        }
+        walk(view, path)
+        return found.joined(separator: " | ")
+    }
+
+    private static func collectVisualEffectViews(_ view: NSView, path: String, into out: inout [String]) {
+        if let effect = view as? NSVisualEffectView {
+            out.append("\(path)[material=\(effect.material.rawValue) blending=\(effect.blendingMode.rawValue)]")
+        }
+        for sub in view.subviews {
+            collectVisualEffectViews(sub, path: "\(path)/\(type(of: sub))", into: &out)
+        }
     }
 
     // MARK: - Helpers

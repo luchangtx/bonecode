@@ -259,6 +259,7 @@ extension Notification.Name {
     static let runConfigsChanged = Notification.Name("BoneCode.runConfigsChanged")
 
     // AI
+    static let aiConfigurationChanged = Notification.Name("BoneCode.aiConfigurationChanged")
     static let aiApplyEditRequested = Notification.Name("BoneCode.aiApplyEditRequested")
     static let aiInsertCommandRequested = Notification.Name("BoneCode.aiInsertCommandRequested")
     static let terminalSendText = Notification.Name("BoneCode.terminalSendText")
@@ -267,13 +268,57 @@ extension Notification.Name {
     static let statusMessage = Notification.Name("BoneCode.statusMessage")
 }
 
+// MARK: - Vibrancy
+
+enum Vibrancy {
+    /// AppKit injects an `NSVisualEffectView` into scroll views that live inside
+    /// a sidebar: material `.sidebar` with `.behindWindow` blending. That layer
+    /// samples the *desktop wallpaper* rather than the window, so the panel
+    /// ignores the app theme entirely — with a dark wallpaper the sidebar looks
+    /// dark even in light mode.
+    ///
+    /// For a themed IDE that is exactly wrong, so every such layer is rewritten
+    /// to a window-relative material and the scroll view paints its own colour.
+    static func neutralize(in root: NSView, background: NSColor, depth: Int = 0) {
+        guard depth < 24 else { return }
+
+        if let scrollView = root as? NSScrollView {
+            scrollView.drawsBackground = true
+            scrollView.backgroundColor = background
+        }
+
+        if let effect = root as? NSVisualEffectView,
+           effect.material == .sidebar || effect.blendingMode == .behindWindow {
+            effect.material = .contentBackground
+            effect.blendingMode = .withinWindow
+            effect.state = .followsWindowActiveState
+            effect.isEmphasized = false
+        }
+
+        for sub in root.subviews {
+            neutralize(in: sub, background: background, depth: depth + 1)
+        }
+    }
+
+    /// True when the hierarchy still contains a wallpaper-sampling layer.
+    static func hasBehindWindowEffect(_ root: NSView, depth: Int = 0) -> Bool {
+        guard depth < 24 else { return false }
+        if let effect = root as? NSVisualEffectView,
+           effect.material == .sidebar || effect.blendingMode == .behindWindow {
+            return true
+        }
+        return root.subviews.contains { hasBehindWindowEffect($0, depth: depth + 1) }
+    }
+}
+
 // MARK: - Layout constants
 
 enum Metrics {
     static let toolbarHeight: CGFloat = 38
     static let tabHeight: CGFloat = 30
-    static let sidebarMinWidth: CGFloat = 180
+    static let sidebarMinWidth: CGFloat = 150
     static let sidebarIdealWidth: CGFloat = 250
+    static let aiPanelMinWidth: CGFloat = 220
     static let aiPanelWidth: CGFloat = 340
     static let statusBarHeight: CGFloat = 22
     static let gutterWidth: CGFloat = 52

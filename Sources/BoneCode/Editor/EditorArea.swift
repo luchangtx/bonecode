@@ -904,9 +904,17 @@ final class WelcomeView: NSView {
         NSLayoutConstraint.activate([
             column.centerXAnchor.constraint(equalTo: centerXAnchor),
             column.centerYAnchor.constraint(equalTo: centerYAnchor),
-            buttonRow.widthAnchor.constraint(equalToConstant: 300),
-            recentStack.widthAnchor.constraint(equalToConstant: 360)
+            column.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 16),
+            column.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16)
         ])
+
+        // Fixed widths, but at a priority that yields when the editor area is
+        // narrow — otherwise they set a hard floor on the whole centre column.
+        for constraint in [buttonRow.widthAnchor.constraint(equalToConstant: 300),
+                           recentStack.widthAnchor.constraint(equalToConstant: 360)] {
+            constraint.priority = .defaultHigh
+            constraint.isActive = true
+        }
 
         applyTheme()
         reloadRecent()

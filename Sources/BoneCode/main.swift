@@ -6,7 +6,18 @@ import AppKit
 
 // `BoneCode --selftest` exercises the engines headlessly and exits.
 if CommandLine.arguments.contains("--selftest") {
-    exit(SelfTest.run() ? 0 : 1)
+    exit(SelfTest.runEngines() ? 0 : 1)
+}
+
+// `BoneCode --uitest` builds a real window hierarchy. AppKit can stall when
+// creating a window in a headless process, so a watchdog turns a hang into a
+// clear failure instead of an infinite wait.
+if CommandLine.arguments.contains("--uitest") {
+    DispatchQueue.global().asyncAfter(deadline: .now() + 90) {
+        FileHandle.standardError.write(Data("\nUITEST TIMEOUT: 界面自检超过 90 秒未完成\n".utf8))
+        exit(3)
+    }
+    exit(SelfTest.runUI() ? 0 : 1)
 }
 
 // `BoneCode --bench [directory]` opens every file through the real editor path

@@ -42,7 +42,30 @@ final class AIService {
     private let d = UserDefaults.standard
     private static let keyAccount = "openai-compatible-api-key"
 
-    private init() {}
+    /// In-memory copy of the API key.
+    ///
+    /// `SecItemCopyMatching` can block for seconds — a locked keychain, an
+    /// authorization prompt, a slow disk. Reading it from the main thread during
+    /// view construction is enough to hang app launch, so the key is loaded once
+    /// on a background queue and only ever read from this cache.
+    private var cachedKey: String?
+    private var didLoadKey = false
+    private let keyQueue = DispatchQueue(label: "bonecode.aikey", qos: .utility)
+
+    private init() {
+        keyQueue.async { [weak self] in
+            let key = Keychain.load(account: Self.keyAccount)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.cachedKey = key
+                self.didLoadKey = true
+                NotificationCenter.default.post(name: .aiConfigurationChanged, object: nil)
+            }
+        }
+    }
+
+    /// True once the background keychain read has finished.
+    var hasLoadedKey: Bool { didLoadKey }
 
     // MARK: - Configuration
 
@@ -66,19 +89,30 @@ final class AIService {
         set { d.set(newValue, forKey: "aiMaxTokens") }
     }
 
+    /// Never touches the keychain on the calling thread — reads come from the
+    /// cache, writes are handed to a background queue.
     var apiKey: String? {
-        get { Keychain.load(account: Self.keyAccount) }
+        get { cachedKey }
         set {
-            if let newValue, !newValue.isEmpty {
-                Keychain.save(newValue, account: Self.keyAccount)
-            } else {
-                Keychain.delete(account: Self.keyAccount)
+            cachedKey = newValue
+            didLoadKey = true
+            let account = Self.keyAccount
+            keyQueue.async {
+                if let newValue, !newValue.isEmpty {
+                    Keychain.save(newValue, account: account)
+                } else {
+                    Keychain.delete(account: account)
+                }
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(name: .aiConfigurationChanged, object: nil)
+                }
             }
         }
     }
 
+    /// Cheap and non-blocking: reads only the cached key.
     var isConfigured: Bool {
-        guard let key = apiKey, !key.isEmpty else { return false }
+        guard let key = cachedKey, !key.isEmpty else { return false }
         return !baseURL.isEmpty && !model.isEmpty
     }
 
@@ -98,7 +132,7 @@ final class AIService {
         onDelta: @escaping (String) -> Void,
         completion: @escaping (Result<String, Error>) -> Void
     ) {
-        guard isConfigured, let key = apiKey else {
+        guard isConfigured, let key = cachedKey else {
             completion(.failure(AIError.notConfigured))
             return
         }

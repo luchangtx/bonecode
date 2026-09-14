@@ -16,6 +16,7 @@ final class PTY {
     private var exitSource: DispatchSourceProcess?
     private let queue = DispatchQueue(label: "bonecode.pty", qos: .userInteractive)
     private var didSignalExit = false
+    private var interrupts = 0
 
     var onOutput: ((Data) -> Void)?
     var onExit: ((Int32) -> Void)?
@@ -113,7 +114,11 @@ final class PTY {
                     return
                 } else {
                     if errno == EAGAIN || errno == EWOULDBLOCK { break }
-                    if errno == EINTR { continue }
+                    if errno == EINTR {
+                        self.interrupts += 1
+                        if self.interrupts > 100 { break }   // never spin forever
+                        continue
+                    }
                     self.finish()
                     return
                 }
@@ -184,11 +189,24 @@ final class PTY {
         data.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             var offset = 0
+            var stalls = 0
             while offset < data.count {
                 let n = Darwin.write(masterFD, base + offset, data.count - offset)
-                if n > 0 { offset += n }
-                else if n < 0 && (errno == EAGAIN || errno == EINTR) { continue }
-                else { break }
+                if n > 0 {
+                    offset += n
+                    stalls = 0
+                } else if n < 0 && errno == EINTR {
+                    continue
+                } else if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // The pty buffer is full and the child is not reading. Busy
+                    // looping here pegs a core and never returns; wait briefly
+                    // and give up rather than freeze the caller.
+                    stalls += 1
+                    if stalls > 250 { break }
+                    usleep(2000)
+                } else {
+                    break
+                }
             }
         }
     }
