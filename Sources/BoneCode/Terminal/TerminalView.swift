@@ -12,6 +12,33 @@ struct TerminalDrawOp {
     let clipWidth: CGFloat?
 }
 
+/// The one number the terminal grid and the drawn text must agree on.
+///
+/// Backgrounds, the selection and the cursor are placed at `col * cellWidth`.
+/// Text is drawn as an attributed string, so its glyphs advance by whatever the
+/// font says. If these two disagree, every character drifts relative to the grid
+/// and the cursor — which lives on the grid — slides off the end of the line.
+///
+/// Measuring a *long* sample and dividing is deliberate: the width of a single
+/// glyph carries sub-pixel rounding, and the original code rounded it **up**
+/// (`ceil`), which overstates the cell and makes the drift grow with the line
+/// length. Averaging a long run cancels that error out.
+enum TerminalCellMetrics {
+
+    static func cellWidth(for font: NSFont) -> CGFloat {
+        let count = 64
+        let sample = String(repeating: "M", count: count)
+        let width = (sample as NSString).size(withAttributes: [.font: font]).width
+        guard width > 0 else { return max(4, font.advancement(forGlyph:
+            font.glyph(withName: "M")).width) }
+        return max(4, width / CGFloat(count))
+    }
+
+    static func cellHeight(for font: NSFont) -> CGFloat {
+        max(8, ceil(font.ascender - font.descender + font.leading))
+    }
+}
+
 /// Splits a row of cells into draw operations.
 ///
 /// ASCII runs are merged into a single string because a monospaced face advances
@@ -171,9 +198,11 @@ final class TerminalView: NSView, NSTextInputClient {
         let biDesc = boldFont.fontDescriptor.withSymbolicTraits([.italic, .bold])
         boldItalicFont = NSFont(descriptor: biDesc, size: fontSize) ?? boldFont
 
-        let sample = "M" as NSString
-        cellWidth = max(4, ceil(sample.size(withAttributes: [.font: regularFont]).width))
-        cellHeight = max(8, ceil(regularFont.ascender - regularFont.descender + regularFont.leading))
+        // Cell metrics come from one shared source, so the grid the cursor uses
+        // and the advances the glyphs make can never disagree. Rounding the cell
+        // up here (the original bug) made text drift out from under the cursor.
+        cellWidth = TerminalCellMetrics.cellWidth(for: regularFont)
+        cellHeight = TerminalCellMetrics.cellHeight(for: regularFont)
     }
 
     @objc private func themeChanged() { needsDisplay = true }

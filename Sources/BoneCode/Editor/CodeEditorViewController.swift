@@ -22,7 +22,11 @@ final class CodeEditorViewController: NSViewController, EditorTabContent {
     private var scrollView: NSScrollView!
     private var ruler: LineNumberRulerView!
     private var loadError: String?
-    private var hasBOM = false
+    /// The byte-order mark read from the file, written back verbatim on save.
+    ///
+    /// Kept as bytes rather than a flag because a UTF-16 file must get its own
+    /// BOM back — writing the UTF-8 one would corrupt it.
+    private var bom: Data?
     private var lineEnding = "\n"
     private var encoding: String.Encoding = .utf8
     private let styleDebouncer = Debouncer(delay: 0.05)
@@ -153,20 +157,43 @@ final class CodeEditorViewController: NSViewController, EditorTabContent {
         }
 
         // Encoding detection, most specific first.
+        //
+        // UTF-16 is only attempted when the file carries an explicit BOM.
+        // `String(data:encoding:.utf16)` without one accepts almost any byte
+        // sequence — a Mach-O header plus NUL padding decoded to 41 characters of
+        // garbage, which then sailed past the binary check and reached the text
+        // view. Requiring a BOM is both more correct and the reason the check
+        // below can be trusted.
         var text: String?
         if data.starts(with: [0xEF, 0xBB, 0xBF]) {
-            hasBOM = true
+            bom = Data([0xEF, 0xBB, 0xBF])
             text = String(data: data.dropFirst(3), encoding: .utf8)
             encoding = .utf8
+        } else if data.starts(with: [0xFF, 0xFE]) {
+            bom = Data([0xFF, 0xFE])
+            text = String(data: data.dropFirst(2), encoding: .utf16LittleEndian)
+            encoding = .utf16LittleEndian
+        } else if data.starts(with: [0xFE, 0xFF]) {
+            bom = Data([0xFE, 0xFF])
+            text = String(data: data.dropFirst(2), encoding: .utf16BigEndian)
+            encoding = .utf16BigEndian
         }
         if text == nil, let s = String(data: data, encoding: .utf8) {
             text = s
             encoding = .utf8
         }
-        if text == nil, let s = String(data: data, encoding: .utf16) {
-            text = s
-            encoding = .utf16
+
+        // Binary check **before** the Latin-1 fallback, which is the whole point:
+        // `String(data:encoding:.isoLatin1)` maps every byte to a character and so
+        // never fails. Falling through to it turned a JPEG into a screen of
+        // mojibake instead of saying the file is not text.
+        if text == nil,
+           FileKind.classify(head: Data(data.prefix(512)), url: fileURL) == .binary {
+            showPlaceholder(binaryMessage(data: data),
+                            action: ("用系统默认应用打开", #selector(openWithDefaultApp(_:))))
+            return
         }
+
         if text == nil, let s = String(data: data, encoding: .isoLatin1) {
             text = s
             encoding = .isoLatin1
@@ -177,7 +204,7 @@ final class CodeEditorViewController: NSViewController, EditorTabContent {
         }
 
         guard var content = text else {
-            showPlaceholder("无法识别文件编码，可能是二进制文件。")
+            showPlaceholder("无法识别文件编码。\n\n这个文件既不是有效的 UTF-8，也不是系统支持的其它文本编码。")
             return
         }
 
@@ -197,7 +224,52 @@ final class CodeEditorViewController: NSViewController, EditorTabContent {
         ruler.needsDisplay = true
     }
 
-    private func showPlaceholder(_ message: String) {
+    /// Explains what a binary file actually is, so the user is not left staring
+    /// at "not text" with no idea what to do next.
+    private func binaryMessage(data: Data) -> String {
+        let size = ByteCountFormatter.string(fromByteCount: Int64(data.count), countStyle: .file)
+        var lines = ["这是二进制文件，不是文本，编辑器不打算把它显示成乱码。"]
+
+        // Name the format when we recognise it, which is far more useful than
+        // "binary". Files that reach this branch are ones the image preview did
+        // not claim, so it is usually an archive, a compiled object, or media.
+        let head = Array(data.prefix(8))
+        let signature: String? = {
+            if head.starts(with: [0x50, 0x4B, 0x03, 0x04]) { return "ZIP 压缩包（.zip/.jar/.docx/.xlsx 等）" }
+            if head.starts(with: [0x1F, 0x8B]) { return "GZIP 压缩包" }
+            if head.starts(with: [0x42, 0x5A, 0x68]) { return "BZIP2 压缩包" }
+            if head.starts(with: [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]) { return "XZ 压缩包" }
+            if head.starts(with: [0x37, 0x7A, 0xBC, 0xAF]) { return "7-Zip 压缩包" }
+            if head.starts(with: [0x7F, 0x45, 0x4C, 0x46]) { return "ELF 可执行文件" }
+            if head.starts(with: [0xCF, 0xFA, 0xED, 0xFE]) || head.starts(with: [0xFE, 0xED, 0xFA, 0xCF])
+                || head.starts(with: [0xCE, 0xFA, 0xED, 0xFE]) { return "Mach-O 可执行文件" }
+            if head.starts(with: [0xCA, 0xFE, 0xBA, 0xBE]) { return "Java class 文件" }
+            if head.starts(with: [0x25, 0x50, 0x44, 0x46]) { return "PDF 文档" }
+            if head.starts(with: [0x53, 0x51, 0x4C, 0x69]) { return "SQLite 数据库" }
+            if head.starts(with: [0x00, 0x61, 0x73, 0x6D]) { return "WebAssembly 模块" }
+            if head.starts(with: [0x49, 0x44, 0x33]) || head.starts(with: [0xFF, 0xFB]) { return "MP3 音频" }
+            if head.count >= 12, head[4...7].elementsEqual(Array("ftyp".utf8)) { return "MP4 / 音视频容器" }
+            if head.starts(with: [0x4F, 0x67, 0x67, 0x53]) { return "Ogg 媒体文件" }
+            if head.starts(with: [0x52, 0x49, 0x46, 0x46]), head.count >= 12,
+               head[8...11].elementsEqual(Array("AVI ".utf8)) { return "AVI 视频" }
+            return nil
+        }()
+
+        if let signature {
+            lines.append("识别为：\(signature)　大小 \(size)")
+        } else {
+            lines.append("未能识别具体格式。大小 \(size)")
+        }
+        lines.append("")
+        lines.append("想查看内容的话，可以用下方的按钮交给系统默认应用，"
+                     + "或者在集成终端里用 xxd / file 等命令检查。")
+        return lines.joined(separator: "\n")
+    }
+
+    /// Shows a centred message in place of the editor. `action` adds one button
+    /// under it, for cases where there is an obvious next step.
+    private func showPlaceholder(_ message: String,
+                                 action: (title: String, selector: Selector)? = nil) {
         let label = NSTextField(wrappingLabelWithString: message)
         label.font = Fonts.ui(size: 13)
         label.textColor = ThemeManager.shared.current.secondaryText
@@ -207,9 +279,29 @@ final class CodeEditorViewController: NSViewController, EditorTabContent {
         NSLayoutConstraint.activate([
             label.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             label.centerYAnchor.constraint(equalTo: view.centerYAnchor),
-            label.widthAnchor.constraint(lessThanOrEqualToConstant: 420)
+            label.widthAnchor.constraint(lessThanOrEqualToConstant: 460)
         ])
+
+        if let action {
+            let button = HoverIconButton(frame: .zero)
+            button.title = action.title
+            button.font = Fonts.ui(size: 12)
+            button.target = self
+            button.action = action.selector
+            button.translatesAutoresizingMaskIntoConstraints = false
+            view.addSubview(button)
+            NSLayoutConstraint.activate([
+                button.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+                button.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 14),
+                button.heightAnchor.constraint(equalToConstant: 22)
+            ])
+        }
         loadError = message
+    }
+
+    /// Hand a file the editor cannot show over to the system.
+    @objc func openWithDefaultApp(_ sender: Any?) {
+        NSWorkspace.shared.open(fileURL)
     }
 
     @discardableResult
@@ -220,7 +312,7 @@ final class CodeEditorViewController: NSViewController, EditorTabContent {
             content = content.replacingOccurrences(of: "\n", with: lineEnding)
         }
         var data = Data()
-        if hasBOM { data.append(contentsOf: [0xEF, 0xBB, 0xBF]) }
+        if let bom { data.append(bom) }
         guard let encoded = content.data(using: encoding) ?? content.data(using: .utf8) else { return false }
         data.append(encoded)
 

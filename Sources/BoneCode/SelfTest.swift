@@ -38,7 +38,10 @@ enum SelfTest {
         testCompletionEngine()
         testTerminalEmulator()
         testTerminalWideChars()
+        testTerminalCellMetrics()
+        testPromptCursorPlacement()
         testFuzzyMatch()
+        testFileKinds()
         testProjectDetection()
         testTerminalRowRendering()
         testEditorLayoutStability()
@@ -410,6 +413,376 @@ enum SelfTest {
         check("光标按显示宽度前进", emulator.cursorCol == 7, detail: "实际 \(emulator.cursorCol)")
         check("宽字符文本可回读", emulator.recentText(lines: 4).hasPrefix("中文abc"),
               detail: "'\(emulator.recentText(lines: 4))'")
+    }
+
+    // MARK: - Prompt cursor placement
+
+    /// Regression: the block cursor sat far to the right of the shell prompt.
+    ///
+    /// The bytes below are real captures of what `zsh -l` writes, taken from a
+    /// pty with the exact `repr` dump. The shape that matters is the "clear the
+    /// partial line" dance:
+    ///
+    ///     ESC[1m ESC[7m % ESC[27m ESC[1m ESC[0m <79 spaces> CR SP CR CR
+    ///     ESC[0m ESC[27m ESC[24m ESC[J  <prompt text>  ESC[K
+    ///
+    /// and, between commands, `CR CR LF` followed by that same dance.
+    ///
+    /// Two things have to hold:
+    ///
+    /// - The 79-space run is a full line's worth of blanks (zsh computes it from
+    ///   the terminal width). It must not leave the cursor on a later row than
+    ///   the prompt ends up on.
+    /// - `CR CR LF` must put the cursor at column 0 of the *next* row. `LF` must
+    ///   not touch the column — that is the whole reason a `CR` precedes it.
+    private static func testPromptCursorPlacement() {
+        section("终端提示符光标位置")
+
+        func clearLineDance() -> String {
+            var s = "\u{1B}[1m\u{1B}[7m%\u{1B}[27m\u{1B}[1m\u{1B}[0m"
+            s += String(repeating: " ", count: 79)
+            s += "\r \r\r"
+            s += "\u{1B}[0m\u{1B}[27m\u{1B}[24m\u{1B}[J"
+            return s
+        }
+        let prompt = "dev@localhost /tmp % "
+
+        // Verbatim capture: first prompt.
+        let firstPrompt = clearLineDance() + prompt + "\u{1B}[K\u{1B}[?2004h"
+
+        // Verbatim capture: after `cd /tmp` — note the `CR CR LF` before the dance.
+        let afterCD = "c\u{08}cd /tmp\u{1B}[?2004l\r\r\n"
+            + clearLineDance() + prompt + "\u{1B}[K\u{1B}[?2004h"
+
+        // Verbatim capture: after `echo hi`.
+        let afterEcho = "e\u{08}echo hi\u{1B}[?2004l\r\r\nhi\r\n"
+            + clearLineDance() + prompt + "\u{1B}[K\u{1B}[?2004h"
+
+        // ---- wide terminal: nothing wraps at all
+        let wide = TerminalEmulator(cols: 100, rows: 8)
+        wide.feed(Data(firstPrompt.utf8))
+        print("      首次提示符 cols=100 → col=\(wide.cursorCol) row=\(wide.cursorRow)")
+        check("宽终端：光标停在提示符末尾", wide.cursorCol == prompt.count,
+              detail: "期望 \(prompt.count)，实际 \(wide.cursorCol)")
+        check("宽终端：提示符在第 0 行", rowText(wide, 0).hasPrefix("dev@localhost"),
+              detail: "'\(rowText(wide, 0))'")
+
+        // ---- the realistic sequence: prompt → command → prompt → command → prompt.
+        //      This is where the drift showed up in the app.
+        for cols in [40, 47, 60, 80, 100, 120] {
+            let emulator = TerminalEmulator(cols: cols, rows: 10)
+            emulator.feed(Data((firstPrompt + afterCD + afterEcho).utf8))
+
+            let row = rowText(emulator, emulator.cursorRow)
+            let all = emulator.recentText(lines: 10)
+            print("      连跑三条命令 cols=\(cols) → col=\(emulator.cursorCol)"
+                  + " row=\(emulator.cursorRow) 该行='\(row.prefix(40))'")
+
+            check("\(cols) 列：光标停在提示符末尾", emulator.cursorCol == prompt.count,
+                  detail: "期望 \(prompt.count)，实际 \(emulator.cursorCol)")
+            check("\(cols) 列：提示符整段落在光标所在行",
+                  row.hasPrefix("dev@localhost /tmp % "),
+                  detail: "'\(row)'")
+            check("\(cols) 列：三次提示符各自只出现一次（没有散行）",
+                  all.components(separatedBy: "dev@localhost").count == 4,
+                  detail: "出现 \(all.components(separatedBy: "dev@localhost").count - 1) 次")
+            check("\(cols) 列：echo 的输出也在屏幕上", all.contains("hi"),
+                  detail: "'\(all.replacingOccurrences(of: "\n", with: "⏎"))'")
+        }
+
+        // ---- LF must not move the column, or `CR CR LF` would be pointless and
+        //      the next prompt would start mid-line.
+        let lf = TerminalEmulator(cols: 40, rows: 6)
+        lf.feed(Data("abcdef\n".utf8))
+        check("LF 不改变列号（列仍为 6）", lf.cursorCol == 6, detail: "实际 \(lf.cursorCol)")
+        check("LF 把光标移到下一行", lf.cursorRow == 1, detail: "实际 \(lf.cursorRow)")
+        lf.feed(Data("\rX".utf8))
+        check("LF 之后的 CR 能回到列 0 再写字符", rowText(lf, 1).hasPrefix("X"),
+              detail: "'\(rowText(lf, 1))'")
+
+        // ---- the 79 spaces must not survive on screen: `ESC[J` clears from the
+        //      cursor down, and the prompt is drawn over the cleared area.
+        let cleaned = TerminalEmulator(cols: 100, rows: 6)
+        cleaned.feed(Data(firstPrompt.utf8))
+        check("清屏后残留空格不会留在屏幕上",
+              !cleaned.recentText(lines: 6).contains(String(repeating: " ", count: 40)),
+              detail: "'\(cleaned.recentText(lines: 6))'")
+    }
+
+    // MARK: - Terminal cell metrics
+
+    /// The terminal grid and the rendered text must agree on one number: the
+    /// advance width of a character cell.
+    ///
+    /// Backgrounds, the selection and the cursor are all placed at
+    /// `col * cellWidth`. Text, however, is drawn as an attributed string, so its
+    /// glyphs advance by whatever the *font* says. If the two disagree, every
+    /// character after the first drifts away from the grid — and the cursor,
+    /// which lives on the grid, visibly slides off the end of the prompt.
+    ///
+    /// The original code rounded the cell width up (`ceil`), so the drift grew
+    /// with the line length. This measures the real numbers.
+    private static func testTerminalCellMetrics() {
+        section("终端字格度量（光标与文本必须同格）")
+
+        for size in [11.0, 12.0, 13.0, 14.0, 16.0, 18.0] {
+            let font = Fonts.code(size: size)
+            let sample = "M" as NSString
+            let oldFormula = max(4, ceil(sample.size(withAttributes: [.font: font]).width))
+            let cellWidth = TerminalCellMetrics.cellWidth(for: font)
+
+            // What the glyphs actually advance by when drawn as a string.
+            var advances: [CGFloat] = []
+            for ch in "Mdev@localhost /tmp % " {
+                let s = String(ch) as NSString
+                advances.append(s.size(withAttributes: [.font: font]).width)
+            }
+            let maxAdvance = advances.max() ?? 0
+
+            // Drift after a 30-character prompt, in cells.
+            let oldDrift = abs(oldFormula - maxAdvance) * 30
+            let newDrift = abs(cellWidth - maxAdvance) * 30
+
+            print(String(format: "      %.0fpt: 旧(ceil) %.3f  新(实测) %.3f  字体步进 %.3f"
+                         + "  → 30 字符偏差 旧 %.2fpt / 新 %.3fpt",
+                         size, oldFormula, cellWidth, maxAdvance, oldDrift, newDrift))
+
+            check("\(Int(size))pt：新字格宽度与字体步进一致",
+                  abs(cellWidth - maxAdvance) < 0.01,
+                  detail: String(format: "cellWidth %.4f vs 步进 %.4f", cellWidth, maxAdvance))
+            check("\(Int(size))pt：30 字符累计偏差小于半格",
+                  newDrift < cellWidth * 0.5,
+                  detail: String(format: "%.3fpt ≈ %.3f 格", newDrift, newDrift / cellWidth))
+            check("\(Int(size))pt：比旧的向上取整公式更准",
+                  newDrift <= oldDrift + 0.001,
+                  detail: String(format: "旧 %.3fpt → 新 %.3fpt", oldDrift, newDrift))
+        }
+
+        // ---- and the end-to-end consequence: a full prompt drawn as one run must
+        //      end exactly where the cursor is placed.
+        let font = Fonts.code(size: 13)
+        let cellWidth = TerminalCellMetrics.cellWidth(for: font)
+        let prompt = "dev@localhost /tmp % "
+        let drawn = (prompt as NSString).size(withAttributes: [.font: font]).width
+        let grid = CGFloat(prompt.count) * cellWidth
+
+        print(String(format: "      13pt：提示符绘制宽度 %.3f  网格宽度 %.3f  偏差 %.3fpt (%.3f 格)",
+                     drawn, grid, abs(drawn - grid), abs(drawn - grid) / cellWidth))
+
+        check("整段提示符的绘制宽度与网格宽度一致（偏差 < 1pt）",
+              abs(drawn - grid) < 1.0,
+              detail: String(format: "绘制 %.2f / 网格 %.2f", drawn, grid))
+        check("30 字符的偏差不会累积到一格以上",
+              abs(drawn - grid) < cellWidth,
+              detail: String(format: "%.3f 格", abs(drawn - grid) / cellWidth))
+
+        // ---- end to end, through the real view: the x the cursor will be drawn
+        //      at must equal the width the prompt actually occupies. This is the
+        //      assertion that would have caught the screenshot's off-by-three-cells
+        //      cursor, because it uses the view's own cellWidth.
+        for size in [11.0, 12.0, 13.0, 14.0, 16.0] {
+            let emulator = TerminalEmulator(cols: 80, rows: 6)
+            let view = TerminalView(emulator: emulator)
+            view.fontSize = size
+            let prompt = "dev@localhost /tmp % "
+            emulator.feed(Data(prompt.utf8))
+
+            let cursorX = CGFloat(emulator.cursorCol) * view.cellWidth
+            let textWidth = (prompt as NSString)
+                .size(withAttributes: [.font: Fonts.code(size: size)]).width
+            let error = abs(cursorX - textWidth)
+
+            print(String(format: "      %.0fpt 视图：光标 x %.2f  文字宽 %.2f  误差 %.2fpt (%.3f 格)",
+                         size, cursorX, textWidth, error, error / view.cellWidth))
+
+            check("\(Int(size))pt：光标 x 与提示符绘制宽度对齐（误差 < 0.5pt）",
+                  error < 0.5,
+                  detail: String(format: "光标 %.2f vs 文字 %.2f", cursorX, textWidth))
+            check("\(Int(size))pt：光标列号等于提示符长度", emulator.cursorCol == prompt.count,
+                  detail: "实际 \(emulator.cursorCol)")
+        }
+
+        // ---- characterisation of the bug that was fixed, so the assertions above
+        //      cannot quietly become vacuous: the old `ceil` formula really did
+        //      push the cursor multiple cells past the end of the prompt.
+        let oldCell = max(4, ceil(("M" as NSString)
+            .size(withAttributes: [.font: Fonts.code(size: 12)]).width))
+        let oldPrompt = "dev@localhost /tmp % "
+        let oldCursorX = CGFloat(oldPrompt.count) * oldCell
+        let oldTextWidth = (oldPrompt as NSString)
+            .size(withAttributes: [.font: Fonts.code(size: 12)]).width
+        let oldCells = (oldCursorX - oldTextWidth) / oldCell
+        print(String(format: "      回归依据：旧公式 12pt 下光标 x %.1f，文字宽 %.1f，偏 %.1fpt = %.2f 格",
+                     oldCursorX, oldTextWidth, oldCursorX - oldTextWidth, oldCells))
+        check("旧公式确实会让光标偏离 2 格以上（说明上面的断言有意义）",
+              oldCells > 2.0,
+              detail: String(format: "%.2f 格", oldCells))
+    }
+
+    // MARK: - File kinds
+
+    /// Files must be classified by content, not by name.
+    ///
+    /// The bug this guards: opening a `.jpg` dumped the raw bytes into the text
+    /// editor as mojibake, because the loader's last-resort
+    /// `String(data:encoding:.isoLatin1)` **never fails** — it maps every byte to
+    /// a character. A JPEG therefore sailed past the "is this binary?" branch and
+    /// was rendered as text.
+    private static func testFileKinds() {
+        section("文件类型识别（按内容而非扩展名）")
+
+        func data(_ bytes: [UInt8]) -> Data { Data(bytes) }
+        let pngURL = URL(fileURLWithPath: "/tmp/x.png")
+        let datURL = URL(fileURLWithPath: "/tmp/x.dat")
+        let txtURL = URL(fileURLWithPath: "/tmp/x.txt")
+
+        // ---- real magic numbers must be recognised
+        let magics: [(String, [UInt8])] = [
+            ("PNG", [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+            ("JPEG", [0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10]),
+            ("GIF87a", Array("GIF87a".utf8)),
+            ("GIF89a", Array("GIF89a".utf8)),
+            ("BMP", [0x42, 0x4D, 0x36, 0x00]),
+            ("TIFF-LE", [0x49, 0x49, 0x2A, 0x00]),
+            ("TIFF-BE", [0x4D, 0x4D, 0x00, 0x2A]),
+            ("WebP", Array("RIFF".utf8) + [0, 0, 0, 0] + Array("WEBP".utf8)),
+            ("HEIC", [0, 0, 0, 0x18] + Array("ftypheic".utf8)),
+            ("ICNS", Array("icns".utf8)),
+            ("ICO", [0x00, 0x00, 0x01, 0x00])
+        ]
+        for (name, bytes) in magics {
+            check("\(name) 魔数被识别为图片",
+                  FileKind.isKnownImageMagic(data(bytes)),
+                  detail: bytes.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " "))
+        }
+
+        // ---- and the negative control: text must not be mistaken for an image
+        check("普通文本不会被误判为图片",
+              !FileKind.isKnownImageMagic(data(Array("public class Demo {}\n".utf8))))
+        check("空文件不会被误判为图片", !FileKind.isKnownImageMagic(Data()))
+
+        // ---- classification uses content, so a lying name does not matter
+        check("PNG 内容即使叫 .dat 也算图片",
+              FileKind.classify(head: data(magics[0].1), url: datURL) == .image)
+        check("JPEG 内容即使叫 .txt 也算图片",
+              FileKind.classify(head: data(magics[1].1), url: txtURL) == .image)
+        check("文本内容即使叫 .png 也算文本（LFS 指针/错误页）",
+              FileKind.classify(head: data(Array("version https://git-lfs...".utf8)), url: pngURL) == .text)
+
+        // ---- binary detection
+        check("JPEG 头部被判定为二进制", FileKind.looksBinary(data(magics[1].1)))
+        check("含 NUL 字节即判定为二进制",
+              FileKind.looksBinary(data([0x41, 0x42, 0x00, 0x43])))
+        check("UTF-8 中文不算二进制",
+              !FileKind.looksBinary(data(Array("中文注释 abc\n".utf8))))
+        check("制表符/换行/ESC 不算二进制（ANSI 日志要能看）",
+              !FileKind.looksBinary(data(Array("\u{1B}[31mred\u{1B}[0m\tx\ny\r\n".utf8))))
+        check("UTF-16 BOM 后的 NUL 不算二进制",
+              !FileKind.looksBinary(data([0xFF, 0xFE, 0x41, 0x00, 0x42, 0x00])))
+        // A tiny sample cannot be judged by ratio: 2 stray bytes in 5 is 40 %,
+        // but such a file is harmless to show.
+        check("短样本不按比例判定（避免误杀）",
+              !FileKind.looksBinary(data(Array("a\u{01}b\u{02}c".utf8))))
+        // …but a realistic text file with an occasional control byte is still text.
+        var mostlyText = data(Array(String(repeating: "the quick brown fox\n", count: 20).utf8))
+        mostlyText.append(0x01)
+        check("长文本里少量控制字符仍算文本",
+              !FileKind.looksBinary(mostlyText),
+              detail: "\(mostlyText.count) 字节，1 个控制字符")
+        // …and a long run of control bytes is binary.
+        let noisy = data([UInt8](repeating: 0x01, count: 64) + [UInt8](repeating: 0x41, count: 16))
+        check("大量控制字符判定为二进制", FileKind.looksBinary(noisy))
+
+        // ---- the exact shape that produced the bug: a JPEG decodes "successfully"
+        //      as Latin-1, so the binary check must run *before* that fallback.
+        let jpegHead = data(magics[1].1)
+        check("JPEG 字节确实能被 Latin-1 解出（说明检查顺序很重要）",
+              String(data: jpegHead, encoding: .isoLatin1) != nil)
+        check("但二进制检查会在 Latin-1 之前拦下它",
+              FileKind.looksBinary(jpegHead))
+
+        // ---- archive / executable signatures used for the placeholder message.
+        //      These are asserted through `isKnownBinaryMagic`, not the ratio
+        //      heuristic: a 4-byte Mach-O header has no NUL and no control bytes,
+        //      so only a signature match can identify it.
+        for (name, bytes) in [("ZIP", [0x50, 0x4B, 0x03, 0x04]),
+                              ("GZIP", [0x1F, 0x8B, 0x08]),
+                              ("Mach-O", [0xCF, 0xFA, 0xED, 0xFE]),
+                              ("Mach-O 64", [0xCF, 0xFA, 0xED, 0xFE, 0x07, 0x00]),
+                              ("ELF", [0x7F, 0x45, 0x4C, 0x46, 0x02]),
+                              ("Java class", [0xCA, 0xFE, 0xBA, 0xBE]),
+                              ("PDF", Array("%PDF-1.7".utf8)),
+                              ("SQLite", Array("SQLite format 3".utf8)),
+                              ("MP3", [0x49, 0x44, 0x33, 0x03]),
+                              ("Ogg", Array("OggS".utf8)),
+                              ("WebAssembly", [0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00])] {
+            check("\(name) 被识别为二进制格式",
+                  FileKind.isKnownBinaryMagic(data(bytes)),
+                  detail: bytes.map { String(format: "%02X", $0) }.joined(separator: " "))
+            check("\(name) 因此会被判为二进制文件",
+                  FileKind.classify(head: data(bytes), url: txtURL) == .binary)
+        }
+
+        // ---- and the negative control for the signature table
+        check("普通文本不匹配任何二进制签名",
+              !FileKind.isKnownBinaryMagic(data(Array("public class Demo {}\n".utf8))))
+        check("UTF-8 中文源码不匹配任何二进制签名",
+              !FileKind.isKnownBinaryMagic(data(Array("// 中文注释\nlet x = 1\n".utf8))))
+
+        // ---- extension hints, used only as a fallback when the file is unreadable
+        check(".jpg 扩展名提示为图片", FileKind.isImageExtension(URL(fileURLWithPath: "/a/B.JPG")))
+        check(".svg 不算位图（它是可编辑的 XML）",
+              !FileKind.isImageExtension(URL(fileURLWithPath: "/a/icon.svg")))
+        check(".txt 不是图片扩展名", !FileKind.isImageExtension(URL(fileURLWithPath: "/a/x.txt")))
+
+        // ---- end to end through the real loader, on real files
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("bonecode-kind-\(UUID().uuidString)")
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        var macho = Data([0xCF, 0xFA, 0xED, 0xFE])           // Mach-O magic
+        macho.append(contentsOf: [UInt8](repeating: 0x00, count: 64))
+        macho.append(contentsOf: Array("not text at all".utf8))
+        let machoURL = dir.appendingPathComponent("payload.bin")
+        try? macho.write(to: machoURL)
+
+        // Bare UTF-16 decoding really does "succeed" on this, which is exactly why
+        // a BOM has to be required before it is attempted.
+        let bareUTF16 = String(data: macho, encoding: .utf16)
+        check("裸 UTF-16 解码确实会「成功」解出乱码（所以必须要求 BOM）",
+              bareUTF16 != nil,
+              detail: "\(bareUTF16?.count ?? 0) 字符")
+        check("而这段字节的 UTF-8 解码会失败", String(data: macho, encoding: .utf8) == nil)
+
+        let binaryEditor = CodeEditorViewController(fileURL: machoURL)
+        _ = binaryEditor.view
+        check("二进制文件不会把内容读进文本视图",
+              binaryEditor.textView.string.isEmpty,
+              detail: "\(binaryEditor.textView.string.count) 字符")
+
+        // ---- a UTF-16 file *with* a BOM must still open as text
+        let utf16URL = dir.appendingPathComponent("notes.txt")
+        var utf16Data = Data([0xFF, 0xFE])
+        utf16Data.append("你好 UTF-16\n".data(using: .utf16LittleEndian) ?? Data())
+        try? utf16Data.write(to: utf16URL)
+        let utf16Editor = CodeEditorViewController(fileURL: utf16URL)
+        _ = utf16Editor.view
+        check("带 BOM 的 UTF-16 文件仍按文本加载",
+              utf16Editor.textView.string.contains("UTF-16"),
+              detail: "'\(utf16Editor.textView.string.trimmingCharacters(in: .newlines))'")
+        check("UTF-16 的中文内容正确解码",
+              utf16Editor.textView.string.contains("你好"),
+              detail: "'\(utf16Editor.textView.string.trimmingCharacters(in: .newlines))'")
+
+        // ---- and a normal UTF-8 file is unaffected
+        let utf8URL = dir.appendingPathComponent("normal.java")
+        try? "public class Normal {}\n".write(to: utf8URL, atomically: true, encoding: .utf8)
+        let utf8Editor = CodeEditorViewController(fileURL: utf8URL)
+        _ = utf8Editor.view
+        check("普通 UTF-8 文件正常加载",
+              utf8Editor.textView.string.contains("public class Normal"),
+              detail: "\(utf8Editor.textView.string.count) 字符")
     }
 
     // MARK: - Fuzzy match
@@ -1327,14 +1700,14 @@ enum SelfTest {
               detail: controller.window?.title ?? "nil")
 
         // ---- open a file through the public path
-        let editor = main.editorArea.open(url: base.appendingPathComponent("Demo.java"))
+        let editor = main.editorArea.open(url: base.appendingPathComponent("Demo.java"))!
         check("打开文件后编辑器已就绪", editor.isViewLoaded)
         check("编辑器读到了文件内容", editor.textView.string.contains("public class Demo"),
               detail: "\(editor.textView.string.count) 字符")
         check("语言识别为 Java", editor.language.id == "java", detail: editor.language.id)
         check("标签页数量为 1", main.editorArea.openFileURLs.count == 1)
 
-        let vue = main.editorArea.open(url: base.appendingPathComponent("App.vue"))
+        let vue = main.editorArea.open(url: base.appendingPathComponent("App.vue"))!
         check("Vue 文件也能打开", vue.language.id == "vue")
         check("标签页数量为 2", main.editorArea.openFileURLs.count == 2)
         main.editorArea.selectTab(for: base.appendingPathComponent("Demo.java"))
@@ -1369,6 +1742,159 @@ enum SelfTest {
         main.editorArea.closeTabs(keeping: 1)
         check("「关闭其他标签页」生效", main.editorArea.openFileURLs.count == 1,
               detail: "剩余 \(main.editorArea.openFileURLs.count) 个")
+
+        // ---- images get a preview tab, not a page of mojibake. Write a real PNG
+        //      and a real binary file and open them through the normal path.
+        let imageURL = base.appendingPathComponent("shot.png")
+        let imageWritten = Self.writeTestPNG(to: imageURL, width: 120, height: 80)
+        check("测试用 PNG 写入成功", imageWritten)
+        if imageWritten {
+            let editorBefore = main.editorArea.openEditors.count
+            let result = main.editorArea.open(url: imageURL)
+            check("打开图片不会返回代码编辑器（而是图片预览）", result == nil)
+            check("图片没有变成代码编辑器标签",
+                  main.editorArea.openEditors.count == editorBefore,
+                  detail: "\(editorBefore) → \(main.editorArea.openEditors.count)")
+            check("图片标签页已创建",
+                  main.editorArea.openFileURLs.contains { $0.lastPathComponent == "shot.png" })
+            check("图片标签页的标题是文件名",
+                  main.editorArea.currentContent?.tabTitle == "shot.png",
+                  detail: main.editorArea.currentContent?.tabTitle ?? "nil")
+            check("图片标签页标注为图片",
+                  main.editorArea.currentContent?.tabSubtitle == "图片",
+                  detail: main.editorArea.currentContent?.tabSubtitle ?? "nil")
+            check("图片标签页是只读的（不会被标脏）",
+                  main.editorArea.currentContent?.tabIsDirty == false)
+            check("图片标签页用 photo 图标",
+                  main.editorArea.currentContent?.tabIconName == "photo",
+                  detail: main.editorArea.currentContent?.tabIconName ?? "nil")
+            check("图片预览视图已构建",
+                  (main.editorArea.currentContent as? ImagePreviewViewController)?
+                      .isViewLoaded == true)
+
+            // ---- and it really decoded the picture, not just claimed to
+            if let preview = main.editorArea.currentContent as? ImagePreviewViewController {
+                check("图片解码成功（显示的是图片而非占位提示）", preview.hasImage,
+                      detail: preview.failureText ?? "ok")
+                check("图片像素尺寸读取正确（120 × 80）",
+                      Int(preview.pixelSize.width) == 120 && Int(preview.pixelSize.height) == 80,
+                      detail: "\(Int(preview.pixelSize.width)) × \(Int(preview.pixelSize.height))")
+                check("图片文件大小被读出", preview.byteSize > 0,
+                      detail: "\(preview.byteSize) 字节")
+                check("信息栏包含尺寸与格式",
+                      preview.infoText.contains("120 × 80") && preview.infoText.contains("PNG"),
+                      detail: preview.infoText)
+
+                // ---- zoom controls must actually change the scale
+                preview.zoomToActual()
+                check("「实际大小」把缩放设为 100%",
+                      abs(preview.effectiveScale - 1) < 0.001,
+                      detail: String(format: "%.3f", preview.effectiveScale))
+
+                let beforeZoom = preview.effectiveScale
+                preview.zoomIn()
+                let afterZoomIn = preview.effectiveScale
+                check("放大按钮提高缩放比例", afterZoomIn > beforeZoom,
+                      detail: String(format: "%.3f → %.3f", beforeZoom, afterZoomIn))
+
+                preview.zoomOut()
+                check("缩小按钮降低缩放比例", preview.effectiveScale < afterZoomIn,
+                      detail: String(format: "%.3f → %.3f", afterZoomIn, preview.effectiveScale))
+                check("放大再缩小回到原来的比例",
+                      abs(preview.effectiveScale - beforeZoom) < 0.001,
+                      detail: String(format: "%.3f vs %.3f", preview.effectiveScale, beforeZoom))
+
+                // ---- zoom must be bounded, or the buttons walk off to infinity
+                for _ in 0..<40 { preview.zoomIn() }
+                check("连续放大有上限（不会无限增长）",
+                      preview.effectiveScale <= 16.001,
+                      detail: String(format: "%.1f", preview.effectiveScale))
+                for _ in 0..<80 { preview.zoomOut() }
+                check("连续缩小有下限（不会变成 0 或负数）",
+                      preview.effectiveScale >= 0.049,
+                      detail: String(format: "%.4f", preview.effectiveScale))
+
+                preview.zoomToFit()
+                check("「适应窗口」的缩放不超过 100%（小图不放大）",
+                      preview.effectiveScale <= 1.001,
+                      detail: String(format: "%.3f", preview.effectiveScale))
+                check("「适应窗口」的缩放为正", preview.effectiveScale > 0,
+                      detail: String(format: "%.3f", preview.effectiveScale))
+
+                // ---- and the picture must actually be painted, not merely
+                //      decoded. Render the canvas offscreen and sample the
+                //      centre: the test PNG is a blue rectangle with a white
+                //      square in the middle, so a correct render is white there.
+                //      `NSView.draw(_:)` does not draw subviews, so render the
+                //      canvas itself rather than the containing hierarchy.
+                let canvas = preview.imageCanvas
+                canvas.frame = NSRect(x: 0, y: 0, width: 200, height: 200)
+                canvas.needsDisplay = true
+                if let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                              pixelsWide: 200, pixelsHigh: 200,
+                                              bitsPerSample: 8, samplesPerPixel: 4,
+                                              hasAlpha: true, isPlanar: false,
+                                              colorSpaceName: .deviceRGB,
+                                              bytesPerRow: 0, bitsPerPixel: 0) {
+                    NSGraphicsContext.saveGraphicsState()
+                    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+                    canvas.draw(canvas.bounds)
+                    NSGraphicsContext.restoreGraphicsState()
+
+                    if let centre = rep.colorAt(x: 100, y: 100)?.usingColorSpace(.deviceRGB) {
+                        let isWhite = centre.redComponent > 0.75
+                            && centre.greenComponent > 0.75 && centre.blueComponent > 0.75
+                        check("图片真的被绘制出来（中心是白色方块）", isWhite,
+                              detail: String(format: "中心像素 rgb(%.2f, %.2f, %.2f)",
+                                             centre.redComponent, centre.greenComponent,
+                                             centre.blueComponent))
+                    } else {
+                        check("能从渲染结果取到中心像素", false)
+                    }
+                    // A corner should be the checkerboard, not the image, which
+                    // proves the image is centred rather than stretched to fill.
+                    if let corner = rep.colorAt(x: 3, y: 3)?.usingColorSpace(.deviceRGB) {
+                        let isCheckerboard = corner.redComponent > 0.7
+                            && corner.greenComponent > 0.7 && corner.blueComponent > 0.7
+                        check("图片四周是棋盘底（没有被拉伸铺满）", isCheckerboard,
+                              detail: String(format: "左上角 rgb(%.2f, %.2f, %.2f)",
+                                             corner.redComponent, corner.greenComponent,
+                                             corner.blueComponent))
+                    }
+                }
+            }
+
+            // Re-opening the same image must reuse the tab, not stack a second one.
+            let tabsAfterFirst = main.editorArea.openFileURLs.count
+            main.editorArea.open(url: imageURL)
+            check("重复打开同一张图片会复用标签页",
+                  main.editorArea.openFileURLs.count == tabsAfterFirst,
+                  detail: "\(tabsAfterFirst) → \(main.editorArea.openFileURLs.count)")
+        }
+
+        // ---- a binary file that is *not* an image must not be rendered as text.
+        //      This is the mojibake case: Latin-1 decodes any byte sequence.
+        let binaryURL = base.appendingPathComponent("payload.bin")
+        var binary = Data([0xCF, 0xFA, 0xED, 0xFE])          // Mach-O magic
+        binary.append(contentsOf: [UInt8](repeating: 0x00, count: 64))
+        binary.append(contentsOf: Array("not text at all".utf8))
+        try? binary.write(to: binaryURL)
+        let binaryEditor = main.editorArea.open(url: binaryURL)
+        check("二进制文件仍走代码编辑器路径（显示占位提示）", binaryEditor != nil)
+        if let binaryEditor {
+            check("二进制文件没有把乱码塞进文本视图",
+                  binaryEditor.textView.string.isEmpty,
+                  detail: "\(binaryEditor.textView.string.count) 字符")
+        }
+
+        // ---- and a genuine text file whose name says otherwise still opens as text
+        let fakeImageURL = base.appendingPathComponent("pointer.png")
+        try? "version https://git-lfs.github.com/spec/v1\noid sha256:abc\n".write(
+            to: fakeImageURL, atomically: true, encoding: .utf8)
+        let textEditor = main.editorArea.open(url: fakeImageURL)
+        check("内容其实是文本的 .png 仍按文本打开（不是图片预览）",
+              textEditor != nil && textEditor?.textView.string.contains("git-lfs") == true,
+              detail: textEditor.map { "\($0.textView.string.count) 字符" } ?? "nil")
 
         // ---- running must reveal the terminal: the command really executes even
         // when the panel is collapsed, which makes the Run button look dead.
@@ -1568,7 +2094,10 @@ enum SelfTest {
             fflush(stdout)
 
             let start = Date()
-            let editor = main.editorArea.open(url: url)
+            guard let editor = main.editorArea.open(url: url) else {
+                print("        跳过（不是文本文件）：\(url.lastPathComponent)")
+                continue
+            }
             editor.view.layoutSubtreeIfNeeded()
             if let lm = editor.textView.layoutManager, let tc = editor.textView.textContainer {
                 lm.ensureLayout(for: tc)          // force full layout: hangs show up here
@@ -1649,6 +2178,29 @@ enum SelfTest {
     }
 
     // MARK: - Helpers
+
+    /// Writes a real, decodable PNG so the image path can be exercised end to
+    /// end. Hand-rolled bytes would test `NSImage`'s error handling instead.
+    @discardableResult
+    private static func writeTestPNG(to url: URL, width: Int, height: Int) -> Bool {
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                         pixelsWide: width, pixelsHigh: height,
+                                         bitsPerSample: 8, samplesPerPixel: 4,
+                                         hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0) else { return false }
+
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSColor.systemBlue.setFill()
+        NSRect(x: 0, y: 0, width: width, height: height).fill()
+        NSColor.white.setFill()
+        NSRect(x: width / 4, y: height / 4, width: width / 2, height: height / 2).fill()
+        NSGraphicsContext.restoreGraphicsState()
+
+        guard let data = rep.representation(using: .png, properties: [:]) else { return false }
+        return (try? data.write(to: url)) != nil
+    }
 
     private static func rowText(_ emulator: TerminalEmulator, _ virtualRow: Int) -> String {
         let cells = emulator.row(virtualRow)

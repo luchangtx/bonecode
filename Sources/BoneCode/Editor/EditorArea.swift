@@ -499,12 +499,20 @@ final class EditorAreaController: NSViewController {
     // MARK: Opening
 
     @discardableResult
-    func open(url: URL) -> CodeEditorViewController {
+    func open(url: URL) -> CodeEditorViewController? {
         let normalized = url.standardizedFileURL
 
         if let idx = contents.firstIndex(where: { $0.tabURL?.path == normalized.path }) {
             select(idx)
-            return contents[idx] as! CodeEditorViewController
+            return contents[idx] as? CodeEditorViewController
+        }
+
+        // Images get a preview tab, not the text editor. Deciding by content
+        // rather than extension means a PNG called `blob.dat` also previews, and
+        // a Git LFS pointer called `photo.png` still opens as text.
+        if FileKind.detect(url: normalized) == .image {
+            openImageTab(normalized)
+            return nil
         }
 
         let editor = CodeEditorViewController(fileURL: normalized)
@@ -521,6 +529,20 @@ final class EditorAreaController: NSViewController {
         select(contents.count - 1)
         RecentProjects.shared.noteFile(normalized)
         return editor
+    }
+
+    /// Open an image as its own tab, reusing the existing one when possible.
+    func openImageTab(_ url: URL) {
+        if let idx = contents.firstIndex(where: { $0.tabURL?.path == url.path }) {
+            select(idx)
+            return
+        }
+        let preview = ImagePreviewViewController(fileURL: url)
+        _ = preview.view
+        contents.append(preview)
+        install(preview, at: contents.count - 1)
+        select(contents.count - 1)
+        RecentProjects.shared.noteFile(url)
     }
 
     /// Open a parsed diff as its own tab, reusing an existing one when possible.

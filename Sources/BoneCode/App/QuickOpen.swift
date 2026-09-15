@@ -437,7 +437,9 @@ final class QuickOpenController: NSObject {
             let hit = searchResults[row]
             close()
             let url = URL(fileURLWithPath: hit.path)
-            if let editor = AppState.shared.editorArea?.open(url: url) {
+            // `open` returns nil when the file turned out to be an image and got
+            // a preview tab instead of a code editor.
+            if let area = AppState.shared.editorArea, let editor = area.open(url: url) {
                 editor.gotoLine(hit.line)
             }
         }
