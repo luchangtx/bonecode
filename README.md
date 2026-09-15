@@ -85,6 +85,7 @@ cd BoneCode
 ./build.sh              # debug 构建 + 打包 .app
 ./build.sh release      # 优化构建
 ./build.sh release run  # 构建并启动
+./build.sh release dmg  # 构建并打包成分发用磁盘映像
 ```
 
 产物在 `dist/BoneCode.app`，可以直接拖进「应用程序」。
@@ -92,6 +93,25 @@ cd BoneCode
 > **为什么脚本里要加 `--disable-sandbox`？**
 > SwiftPM 编译 manifest 时会调用 `sandbox-exec`，在受限环境下会失败并报
 > `sandbox-exec: sandbox_apply: Operation not permitted`。加这个参数绕过即可。
+
+### 打包 DMG
+
+```bash
+./build.sh release dmg          # 等价于先构建再打包
+tools/make-dmg.sh --no-build    # 只打包 dist/ 里已有的 .app
+```
+
+产出 `dist/BoneCode-<版本号>.dmg`（含同名 `.sha256` 校验文件）。映像里是应用本体
+加上一个指向 `/Applications` 的快捷方式，打开后拖过去即可安装。
+
+版本号从 `Info.plist` 的 `CFBundleShortVersionString` 读取，所以文件名不会和包内
+版本脱节。
+
+> **关于 Gatekeeper**：`build.sh` 用的是临时签名（ad-hoc）。在本机运行没问题，
+> 但下载到的副本会带上隔离属性，首次打开时 macOS 会拦下来，需要右键 →「打开」，
+> 或者执行 `xattr -dr com.apple.quarantine /Applications/BoneCode.app`。
+> 想做到下载即开不报警，需要 Developer ID 证书 + 公证；打包前设置环境变量
+> `SIGN_ID="Developer ID Application: 你的名字 (TEAMID)"` 即可让脚本改用正式签名。
 
 ### 自检
 
@@ -106,12 +126,14 @@ cd BoneCode
 界面自检会创建真实 NSWindow。在无显示环境（SSH / 受限沙箱）下 AppKit 内部可能
 停住，所以它单独成一个模式并带 90 秒看门狗——卡住会明确报超时，而不是无限等待。
 
-覆盖 154 项断言：语法高亮（含 Vue 混合语法）、行内词级 diff、Diff 解析、
-补全排序、终端转义序列解析（含 256 色/真彩色/备用屏/宽字符）、
+覆盖 **476 项**断言（引擎 353 + 界面 123）：语法高亮（含 Vue 混合语法）、行内词级
+diff、Diff 解析、补全排序、终端转义序列解析（含 256 色/真彩色/备用屏/宽字符）、
+终端字格度量与光标定位、文件类型识别（图片魔数 / 二进制判定 / 编码回退链）、
+分栏几何（拖动线性响应、富余空间归属、惰性加载）、标签栏命中测试、
 项目类型探测、真实 Git 仓库操作（提交/暂存/日志/图谱/分支/贮藏/cherry-pick/
 revert/reset/撤销提交）、**真实 PTY 端到端**（分配 PTY、shell 交互、
 ANSI 颜色、窗口 resize、退出码传递），以及**整套界面构建冒烟测试**
-（构建真实窗口层级、打开工作区与文件、打开差异页、强制布局、
+（构建真实窗口层级、打开工作区与文件、打开差异页与图片预览、强制布局、
 切换主题与设置、关闭工作区）。
 
 > 界面冒烟测试这一项不是凑数：它在开发过程中真的抓到了两个启动即崩溃的缺陷

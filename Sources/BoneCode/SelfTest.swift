@@ -420,9 +420,12 @@ enum SelfTest {
 
     /// Regression: the block cursor sat far to the right of the shell prompt.
     ///
-    /// The bytes below are real captures of what `zsh -l` writes, taken from a
-    /// pty with the exact `repr` dump. The shape that matters is the "clear the
-    /// partial line" dance:
+    /// The bytes below are a real capture of what `zsh -l` writes, taken from a
+    /// pty with the exact `repr` dump. Only the `user@host` text was replaced
+    /// with a neutral `dev@localhost` — the escape sequences, the 79-space run
+    /// and the CR/LF pattern are byte-for-byte as captured, and those are what
+    /// the test is about. The shape that matters is the "clear the partial line"
+    /// dance:
     ///
     ///     ESC[1m ESC[7m % ESC[27m ESC[1m ESC[0m <79 spaces> CR SP CR CR
     ///     ESC[0m ESC[27m ESC[24m ESC[J  <prompt text>  ESC[K

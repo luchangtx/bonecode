@@ -5,6 +5,7 @@
 #   ./build.sh              # debug build (fast, for development)
 #   ./build.sh release      # optimized build
 #   ./build.sh release run  # build then launch
+#   ./build.sh release dmg  # build then package dist/BoneCode-<version>.dmg
 
 set -euo pipefail
 
@@ -123,4 +124,10 @@ echo "    binary size: $(du -h "$APP_DIR/Contents/MacOS/$APP_NAME" | cut -f1)"
 if [ "$ACTION" = "run" ]; then
   echo "==> Launching"
   open "$APP_DIR"
+fi
+
+if [ "$ACTION" = "dmg" ]; then
+  echo "==> Packaging disk image"
+  # --no-build: we just built it.
+  "$ROOT/tools/make-dmg.sh" --no-build
 fi
