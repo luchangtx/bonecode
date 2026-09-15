@@ -125,3 +125,21 @@ extension NSView {
         for sub in subviews { sub.refreshHoverButtons() }
     }
 }
+
+extension NSView {
+    /// Let a panel be resized freely by its split view.
+    ///
+    /// A split view item's usable width range is derived from its content's
+    /// hugging and compression-resistance priorities. Left at the defaults a
+    /// dense panel holds its fitting width, so the divider stops moving — which a
+    /// user reports as "the divider will not drag". Panels are meant to clip or
+    /// scroll their content, not to dictate the window layout.
+    func relaxSizingForSplitView(depth: Int = 0) {
+        guard depth < 40 else { return }
+        for axis in [NSLayoutConstraint.Orientation.horizontal, .vertical] {
+            setContentHuggingPriority(.defaultLow, for: axis)
+            setContentCompressionResistancePriority(.defaultLow, for: axis)
+        }
+        for sub in subviews { sub.relaxSizingForSplitView(depth: depth + 1) }
+    }
+}

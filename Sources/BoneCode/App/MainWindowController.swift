@@ -62,80 +62,18 @@ final class StatusBarView: NSView {
     func setLanguage(_ text: String) { languageLabel.stringValue = text }
 }
 
-// MARK: - Split view that stays inside the window
-
-/// `NSSplitViewController` sizes its items by each item's preferred width and
-/// will happily let the total exceed the window, which clips the rightmost panel
-/// at the window edge — it reads as "the content is being covered up".
-///
-/// This clamps the divider positions on every layout pass: only when the items
-/// would overflow, so normal dragging is untouched.
-final class ConstrainedSplitViewController: NSSplitViewController {
-
-    private var isClamping = false
-
-    override func viewDidLayout() {
-        super.viewDidLayout()
-        clampDividers()
-    }
-
-    private func clampDividers() {
-        guard !isClamping else { return }
-        let split = splitView
-        let items = splitViewItems
-        guard items.count >= 2 else { return }
-
-        let extent = split.isVertical ? split.bounds.width : split.bounds.height
-        guard extent > 1 else { return }
-
-        let minimums = items.map { max($0.minimumThickness, 60) }
-        guard minimums.reduce(0, +) <= extent else { return }   // impossible; let AppKit squeeze
-
-        // Measure the current sizes from the laid-out subviews.
-        var widths = split.arrangedSubviews.map {
-            split.isVertical ? $0.frame.width : $0.frame.height
-        }
-        guard widths.count == items.count else { return }
-
-        var overflow = widths.reduce(0, +) - extent
-        guard overflow > 0.5 else { return }        // already fits
-
-        // Shrink the widest panel that still has slack, repeatedly.
-        while overflow > 0.5 {
-            let candidates = widths.indices.filter { widths[$0] - minimums[$0] > 0.5 }
-            guard let widest = candidates.max(by: { widths[$0] < widths[$1] }) else { break }
-            let slack = widths[widest] - minimums[widest]
-            let take = min(slack, overflow)
-            widths[widest] -= take
-            overflow -= take
-        }
-
-        isClamping = true
-        var position: CGFloat = 0
-        for index in 0..<(widths.count - 1) {
-            position += widths[index]
-            split.setPosition(position, ofDividerAt: index)
-        }
-        isClamping = false
-    }
-}
-
 // MARK: - Main view controller
 
 final class MainViewController: NSViewController {
 
-    let outerSplit = ConstrainedSplitViewController()
-    let centerSplit = ConstrainedSplitViewController()
+    private(set) var outerSplit: PanelSplitViewController!
+    private(set) var centerSplit: PanelSplitViewController!
 
     let sidebar = SidebarViewController()
     let editorArea = EditorAreaController()
     let terminalPanel = TerminalPanelController()
     let aiPanel = AIPanelViewController()
     let statusBar = StatusBarView()
-
-    private var sidebarItem: NSSplitViewItem!
-    private var aiItem: NSSplitViewItem!
-    private var terminalItem: NSSplitViewItem!
 
     let runner = ProjectRunner()
     private let quickOpen = QuickOpenController()
@@ -152,47 +90,29 @@ final class MainViewController: NSViewController {
         root.setBackground(ThemeManager.shared.current.windowBackground)
 
         // ---- center: editor above, terminal below
-        centerSplit.splitView.isVertical = false
-        centerSplit.splitView.dividerStyle = .thin
-        let editorItem = NSSplitViewItem(viewController: editorArea)
-        editorItem.minimumThickness = 120
-        editorItem.canCollapse = false
-        terminalItem = NSSplitViewItem(viewController: terminalPanel)
-        terminalItem.minimumThickness = 90
-        terminalItem.canCollapse = true
-        terminalItem.isCollapsed = true
-        centerSplit.addSplitViewItem(editorItem)
-        centerSplit.addSplitViewItem(terminalItem)
+        // The editor is the flexible pane: it absorbs spare height and gives it
+        // up first, so the terminal panel keeps the height the user gave it.
+        centerSplit = PanelSplitViewController(vertical: false, panes: [
+            .init(controller: editorArea, minimum: 120,
+                  maximum: .greatestFiniteMagnitude, initial: 600, canCollapse: false,
+                  flexible: true),
+            .init(controller: terminalPanel, minimum: 90,
+                  maximum: .greatestFiniteMagnitude, initial: 220, canCollapse: true,
+                  initiallyCollapsed: true)
+        ])
 
         // ---- outer: sidebar | center | ai
-        outerSplit.splitView.isVertical = true
-        outerSplit.splitView.dividerStyle = .thin
-        // Deliberately NOT sidebarWithViewController: — that wraps the view in a
-        // vibrant NSVisualEffectView whose material follows the system appearance
-        // rather than our theme, which leaves the panel looking unthemed. A plain
-        // item lets us paint an opaque background we control.
-        // Deliberately NOT sidebarWithViewController: — that wraps the view in a
-        // vibrant NSVisualEffectView whose material follows the *system*
-        // appearance rather than our theme, leaving the panel looking unthemed.
-        // A plain item lets us paint an opaque background we control.
-        sidebarItem = NSSplitViewItem(viewController: sidebar)
-        sidebarItem.minimumThickness = Metrics.sidebarMinWidth
-        sidebarItem.maximumThickness = 420
-        sidebarItem.canCollapse = true
-        sidebarItem.holdingPriority = .defaultLow
-
-        let centerItem = NSSplitViewItem(viewController: centerSplit)
-        centerItem.minimumThickness = 280
-
-        aiItem = NSSplitViewItem(viewController: aiPanel)
-        aiItem.minimumThickness = Metrics.aiPanelMinWidth
-        aiItem.maximumThickness = 520
-        aiItem.canCollapse = true
-        aiItem.holdingPriority = .defaultHigh
-
-        outerSplit.addSplitViewItem(sidebarItem)
-        outerSplit.addSplitViewItem(centerItem)
-        outerSplit.addSplitViewItem(aiItem)
+        // Only the centre column is flexible. Without this, widening the window
+        // inflates whichever side panel happens to be widest up to its maximum.
+        outerSplit = PanelSplitViewController(vertical: true, panes: [
+            .init(controller: sidebar, minimum: Metrics.sidebarMinWidth,
+                  maximum: 560, initial: Metrics.sidebarIdealWidth, canCollapse: true),
+            .init(controller: centerSplit, minimum: 280,
+                  maximum: .greatestFiniteMagnitude, initial: 800, canCollapse: false,
+                  flexible: true),
+            .init(controller: aiPanel, minimum: Metrics.aiPanelMinWidth,
+                  maximum: 560, initial: Metrics.aiPanelWidth, canCollapse: true)
+        ])
 
         let splitView = outerSplit.view
         splitView.translatesAutoresizingMaskIntoConstraints = false
@@ -219,12 +139,9 @@ final class MainViewController: NSViewController {
 
     override func viewDidAppear() {
         super.viewDidAppear()
-        // Give the sidebar and editor sensible initial widths.
-        outerSplit.splitView.setPosition(250, ofDividerAt: 0)
-        if outerSplit.splitView.arrangedSubviews.count > 2 {
-            let total = view.bounds.width
-            outerSplit.splitView.setPosition(max(320, total - 348), ofDividerAt: 1)
-        }
+        // Give the side panels sensible widths; the centre column takes the rest.
+        outerSplit.setWidth(Metrics.sidebarIdealWidth, at: 0)
+        outerSplit.setWidth(Metrics.aiPanelWidth, at: 2)
         editorArea.view.window?.makeFirstResponder(nil)
     }
 
@@ -332,12 +249,16 @@ final class MainViewController: NSViewController {
 
     @objc private func handleToggleTerminal(_ note: Notification) {
         let wantsShow = (note.object as? String) != "hide"
-        if terminalItem.isCollapsed && wantsShow {
-            terminalItem.animator().isCollapsed = false
+        let isCollapsed = centerSplit.isCollapsed(at: 1)
+        if isCollapsed && wantsShow {
+            centerSplit.setCollapsed(false, at: 1)
+            // Expanding built the panel's view for the first time, so it has not
+            // been through a theme pass yet.
+            hardenPanelBackgrounds()
             if !terminalPanel.hasSessions { terminalPanel.newTerminal() }
             terminalPanel.focusActiveTerminal()
-        } else if !terminalItem.isCollapsed && (note.object as? String) != "show" {
-            terminalItem.animator().isCollapsed = true
+        } else if !isCollapsed && (note.object as? String) != "show" {
+            centerSplit.setCollapsed(true, at: 1)
         }
         updatePanelToggleStates()
     }
@@ -345,21 +266,24 @@ final class MainViewController: NSViewController {
     /// Expand the terminal without animation and lay it out immediately, so the
     /// session created right afterwards measures the real panel size.
     @objc private func handleRevealTerminal() {
-        if terminalItem.isCollapsed {
-            terminalItem.isCollapsed = false
+        if centerSplit.isCollapsed(at: 1) {
+            centerSplit.setCollapsed(false, at: 1)
+            hardenPanelBackgrounds()
         }
         view.layoutSubtreeIfNeeded()
         updatePanelToggleStates()
     }
 
     @objc private func handleToggleAI() {
-        aiItem.animator().isCollapsed.toggle()
-        if !aiItem.isCollapsed { aiPanel.focusInput() }
+        let wasCollapsed = outerSplit.isCollapsed(at: 2)
+        outerSplit.setCollapsed(!wasCollapsed, at: 2)
+        if wasCollapsed { aiPanel.focusInput() }
         updatePanelToggleStates()
     }
 
     @objc private func handleToggleSidebar() {
-        sidebarItem.animator().isCollapsed.toggle()
+        outerSplit.setCollapsed(!outerSplit.isCollapsed(at: 0), at: 0)
+        updatePanelToggleStates()
     }
 
     @objc private func handleStatus(_ note: Notification) {
@@ -390,8 +314,9 @@ final class MainViewController: NSViewController {
             (aiPanel.view, theme.panelBackground)
         ]
         // Only touch the terminal panel when its view already exists. The panel
-        // starts collapsed, and forcing a collapsed item's view to load from
-        // inside another controller's loadView deadlocks.
+        // starts collapsed and its view is built on demand, so reading
+        // `terminalPanel.view` here would defeat that and allocate a whole
+        // terminal emulator for a panel nobody has opened.
         if terminalPanel.isViewLoaded {
             surfaces.append((terminalPanel.view, theme.terminalBackground))
         }
@@ -401,6 +326,9 @@ final class MainViewController: NSViewController {
             // Strip AppKit's wallpaper-sampling sidebar material, or the panel
             // ignores the theme no matter what colour we set.
             Vibrancy.neutralize(in: view, background: color)
+            // The panel's size range comes from its content's hugging and
+            // compression priorities. Relax them, or the divider refuses to move.
+            view.relaxSizingForSplitView()
         }
         view.wantsLayer = true
         view.layer?.backgroundColor = theme.windowBackground.cgColor
@@ -473,7 +401,7 @@ final class MainViewController: NSViewController {
     /// state rather than as plain buttons.
     func updatePanelToggleStates() {
         toolbarTerminalButton?.isActive = isTerminalVisible
-        toolbarAIButton?.isActive = !aiItem.isCollapsed
+        toolbarAIButton?.isActive = !outerSplit.isCollapsed(at: 2)
     }
 
     func refreshToolbarRunMenu() {
@@ -495,12 +423,12 @@ final class MainViewController: NSViewController {
     func saveAll() { editorArea.saveAll() }
 
     /// Whether the terminal panel is currently expanded.
-    var isTerminalVisible: Bool { !terminalItem.isCollapsed }
+    var isTerminalVisible: Bool { !centerSplit.isCollapsed(at: 1) }
 
     /// Minimum widths the split view items enforce. Exposed so the self-test can
     /// assert the dividers remain draggable.
     var panelMinimumWidths: (sidebar: CGFloat, center: CGFloat, ai: CGFloat) {
-        (sidebarItem.minimumThickness, 280, aiItem.minimumThickness)
+        (Metrics.sidebarMinWidth, 280, Metrics.aiPanelMinWidth)
     }
 
     func handleNewFileAction() { handleNewFile() }

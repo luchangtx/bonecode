@@ -81,6 +81,14 @@ struct Theme {
     let terminalSelection: NSColor
     let ansi: [NSColor]   // 16 standard colors
 
+    // Git status — one distinct hue per change kind, so a glance is enough
+    let gitAdded: NSColor
+    let gitModified: NSColor
+    let gitDeleted: NSColor
+    let gitRenamed: NSColor
+    let gitUntracked: NSColor
+    let gitConflicted: NSColor
+
     // Git graph lanes
     let graphLanes: [NSColor]
 
@@ -170,6 +178,13 @@ extension Theme {
             .hex(0x218BFF), .hex(0xA475F9), .hex(0x3192AA), .hex(0x8C959F)
         ],
 
+        gitAdded: .hex(0x1A7F37),        // green   — 新增
+        gitModified: .hex(0x0969DA),     // blue    — 修改
+        gitDeleted: .hex(0xCF222E),      // red     — 删除
+        gitRenamed: .hex(0x8250DF),      // purple  — 重命名
+        gitUntracked: .hex(0xBC4C00),    // amber   — 未跟踪（未加入 Git）
+        gitConflicted: .hex(0xA40E26),   // dark red— 冲突
+
         graphLanes: [
             .hex(0x2F6FEB), .hex(0x1A7F37), .hex(0x8250DF), .hex(0xBC4C00),
             .hex(0x0969DA), .hex(0xCF222E), .hex(0x1B7C83), .hex(0x9A6700)
@@ -238,6 +253,13 @@ extension Theme {
             .hex(0x6F737A), .hex(0xFF7B86), .hex(0x8CD98F), .hex(0xE8C57A),
             .hex(0x7CB8F7), .hex(0xD7A0D0), .hex(0x4FC3CE), .hex(0xFFFFFF)
         ],
+
+        gitAdded: .hex(0x6AAB73),
+        gitModified: .hex(0x56A8F5),
+        gitDeleted: .hex(0xF75464),
+        gitRenamed: .hex(0xC77DBB),
+        gitUntracked: .hex(0xE8BF6A),
+        gitConflicted: .hex(0xFF7B86),
 
         graphLanes: [
             .hex(0x3574F0), .hex(0x6AAB73), .hex(0xC77DBB), .hex(0xE08855),

@@ -44,7 +44,9 @@ enum SelfTest {
         testEditorLayoutStability()
         testPanelTheming()
         testPanelBounds()
+        testDividerDragging()
         testGitLayer()
+        testGitChangesGrouping()
         testPTYEndToEnd()
 
         return finish()
@@ -716,6 +718,81 @@ enum SelfTest {
         _ = undoBeforeCount
     }
 
+    // MARK: - Git changes panel
+
+    /// Verifies the changes panel separates "not yet in Git" from "tracked and
+    /// modified", and that each change kind is visually distinct.
+    ///
+    /// The grouping is a pure function, so this needs no view and no repository.
+    private static func testGitChangesGrouping() {
+        section("Git 变更分组与配色")
+
+        func change(_ path: String, staged: GitFileStatus, unstaged: GitFileStatus) -> GitFileChange {
+            GitFileChange(path: path, oldPath: nil, staged: staged, unstaged: unstaged)
+        }
+
+        let all = [
+            change("staged-only.txt", staged: .added, unstaged: .unmodified),
+            change("modified-tracked.txt", staged: .unmodified, unstaged: .modified),
+            change("brand-new.txt", staged: .unmodified, unstaged: .untracked),
+            change("both.txt", staged: .modified, unstaged: .modified),      // MM
+            change("deleted.txt", staged: .unmodified, unstaged: .deleted),
+            change("conflict.txt", staged: .conflicted, unstaged: .conflicted),
+        ]
+        let (staged, modified, untracked) = GitChangesView.group(all)
+
+        func paths(_ items: [GitFileChange]) -> Set<String> { Set(items.map { $0.path }) }
+
+        check("已暂存分组包含 add 过的文件", paths(staged).contains("staged-only.txt"))
+        check("已暂存分组包含冲突文件", paths(staged).contains("conflict.txt"))
+        check("未暂存分组包含已跟踪的改动", paths(modified).contains("modified-tracked.txt"))
+        check("未暂存分组包含删除", paths(modified).contains("deleted.txt"))
+        check("未跟踪分组只包含新文件", paths(untracked) == ["brand-new.txt"],
+              detail: "\(paths(untracked).sorted())")
+
+        // The subtle one: a file staged and then edited again belongs to both.
+        check("既暂存又改动的文件同时出现在两个分组（MM 不丢）",
+              paths(staged).contains("both.txt") && paths(modified).contains("both.txt"))
+
+        check("未跟踪文件不会混进未暂存分组", !paths(modified).contains("brand-new.txt"))
+        check("三个分组互不重复地覆盖全部改动（除 MM 外）",
+              paths(staged).union(paths(modified)).union(paths(untracked)).count == all.count,
+              detail: "\(paths(staged).union(paths(modified)).union(paths(untracked)).sorted())")
+
+        // ---- every kind must be distinguishable at a glance
+        let theme = ThemeManager.shared.current
+        let kinds: [GitFileStatus] = [.added, .modified, .deleted, .renamed, .untracked, .conflicted]
+        let colors = kinds.map { $0.color(theme) }
+        var seen: [String: GitFileStatus] = [:]
+        var clash: String?
+        for (index, color) in colors.enumerated() {
+            let key = color.usingColorSpace(.deviceRGB)?.description ?? "\(color)"
+            if let other = seen[key], other != kinds[index] {
+                clash = "\(other.badgeLabel) 与 \(kinds[index].badgeLabel) 同色"
+            }
+            seen[key] = kinds[index]
+        }
+        check("每种变更类型的颜色互不相同", clash == nil, detail: clash ?? "\(kinds.count) 种颜色")
+
+        let labels = kinds.map { $0.badgeLabel }
+        check("每种变更类型都有中文徽标文案",
+              labels.allSatisfy { !$0.isEmpty } && Set(labels).count == kinds.count,
+              detail: labels.joined(separator: " / "))
+        check("未跟踪的徽标明确提到「未加入 Git」",
+              GitFileStatus.untracked.badgeLabel.contains("Git"),
+              detail: GitFileStatus.untracked.badgeLabel)
+
+        // ---- group titles must read correctly (a stray ")" shipped once)
+        for title in ["已暂存 · 将随下次提交 (3)",
+                      "已修改 · 未暂存 (2)",
+                      "未跟踪 · 尚未加入 Git (1)"] {
+            let parens = title.filter { $0 == "(" }.count
+            let closes = title.filter { $0 == ")" }.count
+            check("分组标题括号成对：\(title)", parens == closes && parens == 1,
+                  detail: "(:\(parens) ):\(closes)")
+        }
+    }
+
     // MARK: - PTY
 
     private static func testPTYEndToEnd() {
@@ -943,6 +1020,197 @@ enum SelfTest {
             check("\(Int(size.width))×\(Int(size.height))：中央编辑区宽度合理",
                   centreWidth >= 200, detail: "\(Int(centreWidth)) pt")
         }
+    }
+
+    // MARK: - Divider dragging
+
+    /// Dragging a divider must actually move it.
+    ///
+    /// `NSSplitViewController` sizes its items from the content's Auto Layout
+    /// priorities, and the limits it hands to a drag follow the content's
+    /// *preferred* size — so a dense panel could be neither narrowed nor widened,
+    /// and `setPosition` was silently ignored. `PanelSplitViewController` sets its
+    /// subview frames directly, so the limits are the ones we declare.
+    private static func testDividerDragging() {
+        section("分栏可拖动性")
+
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let controller = MainViewController()
+        _ = controller.view
+
+        func layout(_ width: CGFloat) {
+            controller.view.frame = NSRect(x: 0, y: 0, width: width, height: 800)
+            controller.view.needsLayout = true
+            controller.view.layoutSubtreeIfNeeded()
+        }
+
+        layout(1400)
+        let outer = controller.outerSplit!
+        check("外部分栏是垂直方向（左右分栏）", outer.splitView.isVertical)
+        check("外部分栏有 3 个面板", outer.paneCount == 3, detail: "\(outer.paneCount)")
+
+        // ---- every optional delegate callback must actually be implemented.
+        //
+        // A near-miss on an optional @objc selector compiles with nothing worse
+        // than a warning and is simply never called. `didResizeSubviewsWithOldSize`
+        // instead of `resizeSubviewsWithOldSize` cost a whole round of "the panel
+        // does not respond to resizing". Check the real selector names, and check
+        // that a plausible typo is *not* accepted, so the guard cannot rot.
+        let delegateSelectors = [
+            "splitView:constrainMinCoordinate:ofSubviewAt:",
+            "splitView:constrainMaxCoordinate:ofSubviewAt:",
+            "splitView:resizeSubviewsWithOldSize:",
+            "splitView:canCollapseSubview:",
+            "splitView:shouldCollapseSubview:forDoubleClickOnDividerAtIndex:",
+        ]
+        let missing = delegateSelectors.filter { !outer.responds(to: NSSelectorFromString($0)) }
+        check("分栏控制器实现了全部 NSSplitViewDelegate 回调", missing.isEmpty,
+              detail: missing.isEmpty ? "\(delegateSelectors.count) 个全部命中" : "缺少 \(missing)")
+        check("错误命名的回调不会被误认为已实现（防止静默失效）",
+              !outer.responds(to: NSSelectorFromString("splitView:didResizeSubviewsWithOldSize:")))
+
+        // ---- shrinking the window must re-clamp the panes (exercises the
+        //      resizeSubviewsWithOldSize path, which is what the typo broke)
+        outer.setWidth(460, at: 0)
+        layout(1400)
+        let wideSidebar = outer.width(at: 0)
+        layout(900)
+        let narrowSidebar = outer.width(at: 0)
+        check("窗口变窄后侧边栏被重新夹取（不是溢出窗口）",
+              narrowSidebar < wideSidebar && narrowSidebar <= 560 + 1,
+              detail: "1400pt 时 \(Int(wideSidebar)) → 900pt 时 \(Int(narrowSidebar))")
+        check("窗口变窄后中央编辑区仍保留最小宽度",
+              controller.editorArea.view.frame.width >= 200,
+              detail: "\(Int(controller.editorArea.view.frame.width))")
+        layout(1400)
+
+        // ---- sweep the sidebar pane across its whole range
+        let sidebarBefore = outer.width(at: 0)
+        var reached: [CGFloat: CGFloat] = [:]
+        for target in [160.0, 250.0, 340.0, 460.0] {
+            outer.setWidth(target, at: 0)
+            layout(1400)
+            reached[target] = outer.width(at: 0)
+        }
+        print("      [侧栏] 目标 → 实际 "
+              + reached.map { "\(Int($0.key))→\(Int($0.value))" }.sorted().joined(separator: "  "))
+
+        check("侧边栏可以拖宽", (reached[460] ?? 0) > sidebarBefore + 40,
+              detail: "\(Int(sidebarBefore)) → \(Int(reached[460] ?? 0))")
+        check("侧边栏宽度跟上了目标值", abs((reached[460] ?? 0) - 460) < 24,
+              detail: "期望 ≈460，实际 \(Int(reached[460] ?? 0))")
+        check("侧边栏可以拖窄到 200pt 以内", (reached[160] ?? 999) <= 200,
+              detail: "实际 \(Int(reached[160] ?? -1))")
+        check("侧边栏宽度单调变化（拖动线性响应）",
+              (reached[160] ?? 0) < (reached[250] ?? 0)
+                  && (reached[250] ?? 0) < (reached[340] ?? 0)
+                  && (reached[340] ?? 0) < (reached[460] ?? 0),
+              detail: reached.map { "\(Int($0.value))" }.sorted().joined(separator: " < "))
+
+        // ---- and the AI pane. Start from its minimum so the assertion does not
+        //      depend on whatever width earlier steps left behind.
+        outer.setWidth(Metrics.aiPanelMinWidth, at: 2)
+        layout(1400)
+        let aiBefore = outer.width(at: 2)
+        outer.setWidth(440, at: 2)
+        layout(1400)
+        let aiAfter = outer.width(at: 2)
+        check("AI 面板可以拖宽", aiAfter > aiBefore + 40, detail: "\(Int(aiBefore)) → \(Int(aiAfter))")
+        outer.setWidth(Metrics.aiPanelMinWidth, at: 2)
+        layout(1400)
+        check("AI 面板可以拖窄", outer.width(at: 2) <= Metrics.aiPanelMinWidth + 1,
+              detail: "\(Int(outer.width(at: 2)))")
+
+        // ---- spare space must go to the centre column, not to a side panel.
+        //      Previously slack went to whichever pane was widest, so widening
+        //      the window silently inflated the AI panel to its 560pt maximum.
+        outer.setWidth(250, at: 0)
+        outer.setWidth(Metrics.aiPanelWidth, at: 2)
+        layout(1200)
+        let sidebar1200 = outer.width(at: 0)
+        let ai1200 = outer.width(at: 2)
+        let centre1200 = outer.width(at: 1)
+        layout(1900)
+        let sidebar1900 = outer.width(at: 0)
+        let ai1900 = outer.width(at: 2)
+        let centre1900 = outer.width(at: 1)
+        check("窗口变宽时侧边栏宽度不变", abs(sidebar1900 - sidebar1200) < 2,
+              detail: "1200pt 时 \(Int(sidebar1200)) → 1900pt 时 \(Int(sidebar1900))")
+        check("窗口变宽时 AI 面板宽度不变", abs(ai1900 - ai1200) < 2,
+              detail: "1200pt 时 \(Int(ai1200)) → 1900pt 时 \(Int(ai1900))")
+        check("窗口变宽时多出来的空间全部给中央编辑区",
+              centre1900 - centre1200 > 600,
+              detail: "中央 \(Int(centre1200)) → \(Int(centre1900))（增加 \(Int(centre1900 - centre1200))）")
+
+        // ---- the panes must always tile the split view exactly. A gap here is
+        //      what makes NSSplitView log "frames in an inconsistent state".
+        for width in [900.0, 1200.0, 1600.0, 2400.0] {
+            layout(width)
+            let sum = (0..<outer.paneCount).map { outer.width(at: $0) }.reduce(0, +)
+            let expected = outer.splitView.bounds.width
+                - outer.splitView.dividerThickness * CGFloat(outer.paneCount - 1)
+            check("面板宽度之和精确铺满分栏视图（窗口 \(Int(width))pt）",
+                  abs(sum - expected) < 2,
+                  detail: "面板合计 \(Int(sum))，可用 \(Int(expected))")
+        }
+        layout(1400)
+
+        // ---- the centre column must stay usable at every step
+        check("中央编辑区仍有合理宽度", controller.editorArea.view.frame.width >= 200,
+              detail: "\(Int(controller.editorArea.view.frame.width))")
+
+        // ---- nothing may escape the window
+        let bounds = controller.view.bounds
+        for (name, view) in [("侧边栏", controller.sidebar.view),
+                             ("AI 面板", controller.aiPanel.view)] {
+            let frame = view.convert(view.bounds, to: controller.view)
+            check("拖动后 \(name) 仍在窗口内", bounds.insetBy(dx: -1, dy: -1).contains(frame),
+                  detail: "\(frame)")
+        }
+
+        // ---- collapsing still works
+        outer.setCollapsed(true, at: 0)
+        layout(1400)
+        check("侧边栏可以折叠", outer.isCollapsed(at: 0))
+        check("折叠后侧边栏宽度归零", outer.width(at: 0) < 1, detail: "\(outer.width(at: 0))")
+        outer.setCollapsed(false, at: 0)
+        layout(1400)
+        check("侧边栏可以恢复", !outer.isCollapsed(at: 0) && outer.width(at: 0) > 100,
+              detail: "\(Int(outer.width(at: 0)))")
+
+        // ---- the terminal panel lives in the centre split
+        let centre = controller.centerSplit!
+        check("中央分栏是水平方向（上下分栏）", !centre.splitView.isVertical)
+        check("终端面板默认折叠", centre.isCollapsed(at: 1))
+
+        // ---- a collapsed pane must stay unbuilt until it is opened. Replacing
+        //      NSSplitViewController with a plain NSSplitView quietly cost this
+        //      (every pane's view got loaded in viewDidLoad), and the terminal
+        //      panel is the expensive one. The slot holds a placeholder until the
+        //      real view is needed.
+        check("折叠的终端面板视图尚未构建（不占内存）", !controller.terminalPanel.isViewLoaded)
+        check("折叠槽位里是轻量占位视图（不是终端视图）",
+              type(of: centre.splitView.subviews[1]) == NSView.self,
+              detail: "\(type(of: centre.splitView.subviews[1]))")
+        centre.setCollapsed(false, at: 1)
+        layout(1400)
+        check("展开后槽位换成真正的终端面板视图",
+              centre.splitView.subviews[1] === controller.terminalPanel.view)
+        check("终端面板可以展开", !centre.isCollapsed(at: 1) && centre.width(at: 1) > 50,
+              detail: "\(Int(centre.width(at: 1)))")
+        check("展开后终端面板仍占据第 1 槽位（占位替换没有打乱顺序）",
+              centre.splitView.subviews.count == centre.paneCount,
+              detail: "\(centre.splitView.subviews.count) 个子视图 / \(centre.paneCount) 个面板")
+
+        // ---- collapsing again must not disturb the layout
+        centre.setCollapsed(true, at: 1)
+        layout(1400)
+        check("终端面板可以再次折叠", centre.isCollapsed(at: 1) && centre.width(at: 1) < 1,
+              detail: "\(centre.width(at: 1))")
+        check("折叠后编辑器占满中央分栏",
+              centre.width(at: 0) > centre.splitView.bounds.height - 20,
+              detail: "编辑器 \(Int(centre.width(at: 0))) / 可用 \(Int(centre.splitView.bounds.height))")
     }
 
     // MARK: - Panel theming
@@ -1208,8 +1476,9 @@ enum SelfTest {
                 if !effects.isEmpty {
                     print("      视觉特效视图: \(effects.joined(separator: " | "))")
                 }
-                check("\(label)：没有会覆盖主题的视觉特效视图", effects.isEmpty,
-                      detail: effects.joined(separator: " | "))
+                let offenders = effects.filter { $0.hasPrefix("❌") }
+                check("\(label)：没有会覆盖主题的视觉特效视图", offenders.isEmpty,
+                      detail: offenders.joined(separator: " | "))
 
                 // Surfaces that never got a background would show through.
                 var unbacked: [String] = []
@@ -1287,7 +1556,6 @@ enum SelfTest {
         for path in files {
             index += 1
             let url = URL(fileURLWithPath: path)
-            let name = url.lastPathComponent
             let relative = path.hasPrefix(root.path + "/")
                 ? String(path.dropFirst(root.path.count + 1))
                 : path
@@ -1356,9 +1624,24 @@ enum SelfTest {
         return found.joined(separator: " | ")
     }
 
+    /// Collects the visual effect layers that could fight the app theme.
+    ///
+    /// Not every injected layer is a problem, so the distinction is recorded
+    /// rather than the mere presence of one:
+    ///
+    /// - `.behindWindow` blending samples the **desktop wallpaper**, and the
+    ///   `.sidebar` material is what AppKit uses for its own vibrant sidebar
+    ///   wrapper. Either one makes a panel ignore the theme — these are marked
+    ///   `❌` and are what the assertion fails on.
+    /// - `.contentBackground` + `.withinWindow` samples the **window**, which we
+    ///   already painted, so it cannot override the theme. Marked `ok`.
     private static func collectVisualEffectViews(_ view: NSView, path: String, into out: inout [String]) {
         if let effect = view as? NSVisualEffectView {
-            out.append("\(path)[material=\(effect.material.rawValue) blending=\(effect.blendingMode.rawValue)]")
+            let samplesOutside = effect.blendingMode == .behindWindow
+                || effect.material == .sidebar
+            let label = "\(path)[material=\(effect.material.rawValue) "
+                + "blending=\(effect.blendingMode.rawValue)]"
+            out.append(samplesOutside ? "❌ \(label)" : "ok \(label)")
         }
         for sub in view.subviews {
             collectVisualEffectViews(sub, path: "\(path)/\(type(of: sub))", into: &out)

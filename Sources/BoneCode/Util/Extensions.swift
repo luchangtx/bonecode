@@ -271,26 +271,39 @@ extension Notification.Name {
 // MARK: - Vibrancy
 
 enum Vibrancy {
-    /// AppKit injects an `NSVisualEffectView` into scroll views that live inside
-    /// a sidebar: material `.sidebar` with `.behindWindow` blending. That layer
-    /// samples the *desktop wallpaper* rather than the window, so the panel
-    /// ignores the app theme entirely — with a dark wallpaper the sidebar looks
-    /// dark even in light mode.
+    /// Rewrites every `NSVisualEffectView` AppKit injected into our hierarchy.
     ///
-    /// For a themed IDE that is exactly wrong, so every such layer is rewritten
-    /// to a window-relative material and the scroll view paints its own colour.
+    /// Two different layers show up:
+    ///
+    /// 1. A **sidebar** wrapper: material `.sidebar` with `.behindWindow`
+    ///    blending. That samples the *desktop wallpaper* rather than the window,
+    ///    so the panel ignores the app theme entirely — with a dark wallpaper the
+    ///    sidebar looks dark even in light mode.
+    /// 2. A **scroll-view content background** (`_NSScrollViewContentBackgroundView`,
+    ///    material `.contentBackground`, blending `.withinWindow`). Harmless in
+    ///    itself, but it still washes our own colour out, and AppKit injects it
+    ///    lazily — so it appears after the first layout and can be missed by a
+    ///    one-shot pass.
+    ///
+    /// The app never creates a visual effect view on purpose, so anything found
+    /// here is unwanted. Force it window-relative and let the scroll view paint
+    /// its own colour instead.
+    ///
+    /// Re-run on every theme change: AppKit reinstates these views.
     static func neutralize(in root: NSView, background: NSColor, depth: Int = 0) {
         guard depth < 24 else { return }
 
         if let scrollView = root as? NSScrollView {
             scrollView.drawsBackground = true
             scrollView.backgroundColor = background
+            scrollView.contentView.drawsBackground = true
+            scrollView.contentView.backgroundColor = background
         }
 
-        if let effect = root as? NSVisualEffectView,
-           effect.material == .sidebar || effect.blendingMode == .behindWindow {
-            effect.material = .contentBackground
-            effect.blendingMode = .withinWindow
+        if let effect = root as? NSVisualEffectView {
+            // Never let a layer sample anything outside this window.
+            if effect.blendingMode != .withinWindow { effect.blendingMode = .withinWindow }
+            if effect.material != .contentBackground { effect.material = .contentBackground }
             effect.state = .followsWindowActiveState
             effect.isEmphasized = false
         }

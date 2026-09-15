@@ -777,7 +777,7 @@ final class SyntaxHighlighter {
 
             if c == 0x3C { // '<'
                 let isClose = i + 1 < end && u[i + 1] == 0x2F
-                var nameStart = i + (isClose ? 2 : 1)
+                let nameStart = i + (isClose ? 2 : 1)
                 guard nameStart < end, isLetter(u[nameStart]) || u[nameStart] == 0x21 else {
                     emit(&out, i, i + 1, .punctuation); i += 1; continue
                 }

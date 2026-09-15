@@ -45,6 +45,29 @@ final class GitChangesView: NSView {
         let items: [GitFileChange]
     }
 
+    /// Splits a change list into the three groups the panel shows.
+    ///
+    /// Extracted as a pure function so the grouping rules can be asserted without
+    /// building a view. The rules are subtler than they look:
+    ///
+    /// - A file can be in **two** groups at once. `git add` then edit again gives
+    ///   `MM`, and the user must see it both as staged content and as a pending
+    ///   modification. An `else if` chain silently drops one of them.
+    /// - Conflicts belong with the staged group, because resolving them means
+    ///   staging the result.
+    /// - Untracked files are their own group: they are invisible to `git diff`
+    ///   and to most "what changed" views, so they need a heading of their own.
+    static func group(_ changes: [GitFileChange]) -> (staged: [GitFileChange],
+                                                      modified: [GitFileChange],
+                                                      untracked: [GitFileChange]) {
+        let staged = changes.filter { $0.hasStaged || $0.isConflicted }
+        let modified = changes.filter {
+            $0.hasUnstaged && !$0.isConflicted && $0.unstaged != .untracked
+        }
+        let untracked = changes.filter { $0.unstaged == .untracked }
+        return (staged, modified, untracked)
+    }
+
     var onNeedsRefresh: (() -> Void)?
     var onShowDiff: ((GitFileChange, Bool) -> Void)?
     var onInfo: ((String) -> Void)?
@@ -127,6 +150,10 @@ final class GitChangesView: NSView {
             button.font = Fonts.ui(size: 10.5)
             button.target = self
             button.action = action
+            // Must be able to shrink, or these two rows set a hard floor of ~285pt
+            // on the whole sidebar and the divider cannot be dragged in.
+            button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            button.cell?.lineBreakMode = .byTruncatingTail
             bottomBar.addArrangedSubview(button)
         }
 
@@ -164,10 +191,12 @@ final class GitChangesView: NSView {
         aiButton.target = self
         aiButton.action = #selector(generateCommitMessage)
 
-        commitBar.addArrangedSubview(commitButton)
-        commitBar.addArrangedSubview(commitPushButton)
-        commitBar.addArrangedSubview(amendButton)
-        commitBar.addArrangedSubview(aiButton)
+        for button in [commitButton, commitPushButton, amendButton, aiButton] {
+            // Same reason as the staging row above.
+            button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            button.cell?.lineBreakMode = .byTruncatingTail
+            commitBar.addArrangedSubview(button)
+        }
 
         for sub in [scrollView, messageScroll, statusLabel, bottomBar, commitBar] {
             sub.translatesAutoresizingMaskIntoConstraints = false
@@ -221,14 +250,23 @@ final class GitChangesView: NSView {
     func update(with state: GitRepoState?) {
         applyTheme()
         allChanges = state?.changes ?? []
-        let staged = allChanges.filter { $0.hasStaged || $0.isConflicted }
-        let unstaged = allChanges.filter { $0.hasUnstaged && !$0.isConflicted }
+
+        // Three groups, because "not yet added to Git" is a different thing from
+        // "tracked but modified", and users look for them in different places.
+        let (staged, modified, untracked) = Self.group(allChanges)
+
         var built: [Section] = []
         if !staged.isEmpty {
-            built.append(Section(title: "已暂存 (\(staged.count))", isStaged: true, items: staged))
+            built.append(Section(title: "已暂存 · 将随下次提交 (\(staged.count))",
+                                 isStaged: true, items: staged))
         }
-        if !unstaged.isEmpty {
-            built.append(Section(title: "未暂存 (\(unstaged.count))", isStaged: false, items: unstaged))
+        if !modified.isEmpty {
+            built.append(Section(title: "已修改 · 未暂存 (\(modified.count))",
+                                 isStaged: false, items: modified))
+        }
+        if !untracked.isEmpty {
+            built.append(Section(title: "未跟踪 · 尚未加入 Git (\(untracked.count))",
+                                 isStaged: false, items: untracked))
         }
         sections = built
         outlineView.reloadData()
@@ -480,6 +518,14 @@ extension GitChangesView: NSOutlineViewDataSource, NSOutlineViewDelegate {
             status.translatesAutoresizingMaskIntoConstraints = false
             status.font = Fonts.code(size: 10, bold: true)
             status.alignment = .center
+            // A tinted badge reads far faster than a bare coloured letter.
+            status.isBezeled = false
+            status.isEditable = false
+            status.drawsBackground = true
+            status.wantsLayer = true
+            status.layer?.cornerRadius = 3
+            status.layer?.borderWidth = 1
+            status.layer?.masksToBounds = true
             let label = NSTextField(labelWithString: "")
             label.translatesAutoresizingMaskIntoConstraints = false
             label.lineBreakMode = .byTruncatingMiddle
@@ -494,7 +540,8 @@ extension GitChangesView: NSOutlineViewDataSource, NSOutlineViewDelegate {
             NSLayoutConstraint.activate([
                 status.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 2),
                 status.centerYAnchor.constraint(equalTo: v.centerYAnchor),
-                status.widthAnchor.constraint(equalToConstant: 13),
+                status.widthAnchor.constraint(equalToConstant: 16),
+                status.heightAnchor.constraint(equalToConstant: 14),
 
                 label.leadingAnchor.constraint(equalTo: status.trailingAnchor, constant: 4),
                 label.centerYAnchor.constraint(equalTo: v.centerYAnchor),
@@ -508,19 +555,33 @@ extension GitChangesView: NSOutlineViewDataSource, NSOutlineViewDelegate {
 
         let status = change.isConflicted ? GitFileStatus.conflicted
             : (change.hasStaged ? change.staged : change.unstaged)
-        if let statusField = cell.subviews.first as? NSTextField {
-            statusField.stringValue = status.letter
-            statusField.textColor = status.color(theme)
+        let statusColor = status.color(theme)
+
+        if let badge = cell.subviews.first as? NSTextField {
+            badge.stringValue = status.letter
+            badge.textColor = statusColor
+            badge.backgroundColor = statusColor.withAlphaComponent(0.16)
+            badge.layer?.borderColor = statusColor.withAlphaComponent(0.45).cgColor
+            badge.toolTip = status.badgeLabel
         }
+
         cell.textField?.stringValue = change.displayName
-        cell.textField?.textColor = theme.text
+        // Colour the name too — added green, deleted red, untracked amber. That is
+        // what makes the change kind readable without decoding the letter.
+        switch status {
+        case .added: cell.textField?.textColor = theme.gitAdded
+        case .untracked: cell.textField?.textColor = theme.gitUntracked
+        case .deleted: cell.textField?.textColor = theme.gitDeleted
+        case .conflicted: cell.textField?.textColor = theme.gitConflicted
+        default: cell.textField?.textColor = theme.text
+        }
         if let dirField = cell.subviews.last as? NSTextField, dirField !== cell.textField {
             dirField.stringValue = change.directory.isEmpty ? "" : change.directory
             dirField.textColor = theme.tertiaryText
         }
         cell.toolTip = change.isConflicted
             ? "\(change.path)  ·  存在冲突，需要手动解决"
-            : change.path
+            : "\(change.path)  ·  \(status.badgeLabel)"
         return cell
     }
 

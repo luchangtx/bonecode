@@ -46,14 +46,33 @@ enum GitFileStatus: String {
         }
     }
 
+    /// One distinct hue per kind, so the change type is readable at a glance.
     func color(_ theme: Theme) -> NSColor {
         switch self {
-        case .added, .untracked: return theme.diffAddedText
-        case .deleted, .conflicted: return theme.diffRemovedText
-        case .modified: return theme.attribute
-        case .renamed, .copied: return theme.type
-        case .typeChanged: return theme.constant
+        case .added: return theme.gitAdded
+        case .modified: return theme.gitModified
+        case .deleted: return theme.gitDeleted
+        case .renamed, .copied: return theme.gitRenamed
+        case .untracked: return theme.gitUntracked
+        case .conflicted: return theme.gitConflicted
+        case .typeChanged: return theme.gitRenamed
         case .ignored, .unmodified: return theme.tertiaryText
+        }
+    }
+
+    /// Short label used in the badge tooltip.
+    var badgeLabel: String {
+        switch self {
+        case .added: return "新增"
+        case .modified: return "修改"
+        case .deleted: return "删除"
+        case .renamed: return "重命名"
+        case .copied: return "复制"
+        case .typeChanged: return "类型变更"
+        case .untracked: return "新文件（未加入 Git）"
+        case .conflicted: return "冲突"
+        case .ignored: return "已忽略"
+        case .unmodified: return "无变化"
         }
     }
 }
