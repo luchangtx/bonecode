@@ -1,8 +1,8 @@
 import AppKit
 
-// MARK: - Tab bar
+// MARK: - Editor tab commands
 
-/// Commands offered by the tab context menu.
+/// Commands offered by the editor tab context menu.
 enum EditorTabAction {
     case close
     case closeOthers
@@ -14,293 +14,8 @@ enum EditorTabAction {
     case openInTerminal
 }
 
-protocol EditorTabBarDelegate: AnyObject {
-    func tabBar(_ bar: EditorTabBar, didSelect index: Int)
-    func tabBar(_ bar: EditorTabBar, didClose index: Int)
-    func tabBar(_ bar: EditorTabBar, perform action: EditorTabAction, on index: Int)
-}
-
-/// Hand-drawn tab strip. A stack of NSButtons would need a lot of layout code
-/// and would still not match the IDEA-like look, so we draw and hit-test.
-final class EditorTabBar: NSView {
-
-    struct Tab {
-        let title: String
-        let dirty: Bool
-        let iconName: String
-        let isPinned: Bool
-    }
-
-    var tabs: [Tab] = [] {
-        didSet {
-            if selectedIndex >= tabs.count { selectedIndex = tabs.count - 1 }
-            needsDisplay = true
-        }
-    }
-
-    var selectedIndex: Int = -1 {
-        didSet { needsDisplay = true }
-    }
-
-    weak var delegate: EditorTabBarDelegate?
-
-    private var scrollOffset: CGFloat = 0
-    private var tabRects: [NSRect] = []
-    private var closeRects: [NSRect] = []
-    private var hoverIndex: Int = -1
-    private var trackingArea: NSTrackingArea?
-
-    private let minTabWidth: CGFloat = 110
-    private let maxTabWidth: CGFloat = 230
-    private let iconWidth: CGFloat = 18
-    private let closeWidth: CGFloat = 22
-    private let horizontalPadding: CGFloat = 9
-
-    override var isFlipped: Bool { true }
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        wantsLayer = true
-        NotificationCenter.default.addObserver(self, selector: #selector(themeChanged),
-                                               name: .themeDidChange, object: nil)
-    }
-
-    required init?(coder: NSCoder) { fatalError("not supported") }
-
-    deinit { NotificationCenter.default.removeObserver(self) }
-
-    @objc private func themeChanged() { needsDisplay = true }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let trackingArea { removeTrackingArea(trackingArea) }
-        let area = NSTrackingArea(rect: bounds,
-                                  options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
-                                  owner: self, userInfo: nil)
-        addTrackingArea(area)
-        trackingArea = area
-    }
-
-    // MARK: Layout
-
-    private func widthFor(_ tab: Tab) -> CGFloat {
-        let font = Fonts.ui(size: 12)
-        let textWidth = (tab.title as NSString).size(withAttributes: [.font: font]).width
-        let total = horizontalPadding * 2 + iconWidth + textWidth + closeWidth
-        return min(maxTabWidth, max(minTabWidth, total))
-    }
-
-    private func layoutTabs() {
-        tabRects.removeAll()
-        closeRects.removeAll()
-        var x: CGFloat = 0
-        let h = bounds.height
-        for tab in tabs {
-            let w = widthFor(tab)
-            let rect = NSRect(x: x - scrollOffset, y: 0, width: w, height: h)
-            tabRects.append(rect)
-            closeRects.append(NSRect(x: rect.maxX - closeWidth - 2, y: (h - 16) / 2, width: 16, height: 16))
-            x += w
-        }
-        contentWidth = x
-    }
-
-    private var contentWidth: CGFloat = 0
-
-    private func clampScroll() {
-        let maxOffset = max(0, contentWidth - bounds.width)
-        scrollOffset = min(max(0, scrollOffset), maxOffset)
-    }
-
-    func scrollToSelected() {
-        guard selectedIndex >= 0, selectedIndex < tabRects.count else { return }
-        let rect = tabRects[selectedIndex]
-        if rect.minX < 0 { scrollOffset += rect.minX - 8 }
-        else if rect.maxX > bounds.width { scrollOffset += rect.maxX - bounds.width + 8 }
-        clampScroll()
-        needsDisplay = true
-    }
-
-    // MARK: Drawing
-
-    override func draw(_ dirtyRect: NSRect) {
-        let theme = ThemeManager.shared.current
-        theme.tabBarBackground.setFill()
-        dirtyRect.fill()
-
-        layoutTabs()
-        clampScroll()
-
-        let titleFont = Fonts.ui(size: 12)
-        let activeFont = Fonts.ui(size: 12, weight: .medium)
-
-        for (index, tab) in tabs.enumerated() {
-            let rect = tabRects[index]
-            guard rect.intersects(dirtyRect) else { continue }
-            let isSelected = index == selectedIndex
-
-            // background
-            if isSelected {
-                theme.tabActiveBackground.setFill()
-                rect.fill()
-                theme.accent.setFill()
-                NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: 2).fill()
-            } else if index == hoverIndex {
-                theme.hover.setFill()
-                rect.fill()
-            } else {
-                theme.tabInactiveBackground.setFill()
-                rect.fill()
-            }
-
-            // separator
-            theme.subtleBorder.setStroke()
-            let sep = NSBezierPath()
-            sep.move(to: NSPoint(x: rect.maxX - 0.5, y: 5))
-            sep.line(to: NSPoint(x: rect.maxX - 0.5, y: rect.maxY - 5))
-            sep.lineWidth = 1
-            sep.stroke()
-
-            // icon
-            let iconColor = isSelected ? theme.accent : FileIcons.color(forName: tab.iconName, theme: theme)
-            if let img = Icons.symbol(tab.iconName, size: 11.5) {
-                let tinted = tintedImage(img, color: iconColor)
-                let iconRect = NSRect(x: rect.minX + horizontalPadding,
-                                      y: rect.midY - 7, width: 14, height: 14)
-                tinted?.draw(in: iconRect, from: .zero, operation: .sourceOver, fraction: 1)
-            }
-
-            // title
-            let titleColor = isSelected ? theme.text : theme.secondaryText
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: isSelected ? activeFont : titleFont,
-                .foregroundColor: titleColor
-            ]
-            let available = rect.width - horizontalPadding * 2 - iconWidth - closeWidth
-            let attributed = NSAttributedString(string: tab.title, attributes: attrs)
-            let textSize = attributed.size()
-            let textRect = NSRect(x: rect.minX + horizontalPadding + iconWidth,
-                                  y: rect.midY - textSize.height / 2,
-                                  width: min(available, textSize.width),
-                                  height: textSize.height)
-            attributed.draw(with: textRect, options: [.truncatesLastVisibleLine, .usesLineFragmentOrigin])
-
-            // dirty dot / close button
-            let closeRect = closeRects[index]
-            if tab.dirty {
-                let dotSize: CGFloat = 8
-                theme.secondaryText.setFill()
-                NSBezierPath(ovalIn: NSRect(x: closeRect.midX - dotSize / 2,
-                                            y: closeRect.midY - dotSize / 2,
-                                            width: dotSize, height: dotSize)).fill()
-            } else if index == hoverIndex || isSelected {
-                if let img = Icons.symbol("xmark", size: 9, weight: .semibold) {
-                    let tinted = tintedImage(img, color: theme.secondaryText)
-                    tinted?.draw(in: closeRect.insetBy(dx: 3.5, dy: 3.5),
-                                 from: .zero, operation: .sourceOver, fraction: 1)
-                }
-            }
-        }
-
-        // bottom border
-        theme.border.setFill()
-        NSRect(x: 0, y: bounds.height - 1, width: bounds.width, height: 1).fill()
-    }
-
-    private func tintedImage(_ image: NSImage, color: NSColor) -> NSImage? {
-        let img = image.copy() as? NSImage
-        img?.lockFocus()
-        color.set()
-        NSRect(origin: .zero, size: image.size).fill(using: .sourceAtop)
-        img?.unlockFocus()
-        img?.isTemplate = false
-        return img
-    }
-
-    // MARK: Interaction
-
-    private func index(at point: NSPoint) -> Int? {
-        for (i, rect) in tabRects.enumerated() where rect.contains(point) { return i }
-        return nil
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        let p = convert(event.locationInWindow, from: nil)
-        guard let index = index(at: p) else { return }
-        if closeRects.indices.contains(index), closeRects[index].contains(p) {
-            delegate?.tabBar(self, didClose: index)
-            return
-        }
-        delegate?.tabBar(self, didSelect: index)
-    }
-
-    override func mouseMoved(with event: NSEvent) {
-        let p = convert(event.locationInWindow, from: nil)
-        let idx = index(at: p) ?? -1
-        if idx != hoverIndex {
-            hoverIndex = idx
-            needsDisplay = true
-        }
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        if hoverIndex != -1 {
-            hoverIndex = -1
-            needsDisplay = true
-        }
-    }
-
-    override func scrollWheel(with event: NSEvent) {
-        scrollOffset -= event.scrollingDeltaX + event.scrollingDeltaY
-        clampScroll()
-        needsDisplay = true
-    }
-
-    // MARK: - Context menu
-
-    private var clickedIndex = -1
-
-    override func menu(for event: NSEvent) -> NSMenu? {
-        let point = convert(event.locationInWindow, from: nil)
-        guard let index = index(at: point) else { return nil }
-        clickedIndex = index
-        if index != selectedIndex {
-            delegate?.tabBar(self, didSelect: index)
-        }
-
-        let menu = NSMenu()
-        let hasOthers = tabs.count > 1
-        let hasRight = index < tabs.count - 1
-        let entries: [(String, EditorTabAction, Bool)] = [
-            ("关闭", .close, true),
-            ("关闭其他标签页", .closeOthers, hasOthers),
-            ("关闭右侧标签页", .closeToRight, hasRight),
-            ("关闭所有标签页", .closeAll, hasOthers),
-            ("", .close, false),
-            ("复制完整路径", .copyPath, true),
-            ("在 Finder 中显示", .revealInFinder, true),
-            ("重新从磁盘加载", .reloadFromDisk, true),
-            ("在终端中打开所在目录", .openInTerminal, true)
-        ]
-        for (title, action, enabled) in entries {
-            if title.isEmpty {
-                menu.addItem(.separator())
-                continue
-            }
-            let item = NSMenuItem(title: title, action: #selector(menuAction(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = action
-            item.isEnabled = enabled
-            menu.addItem(item)
-        }
-        return menu
-    }
-
-    @objc private func menuAction(_ sender: NSMenuItem) {
-        guard let action = sender.representedObject as? EditorTabAction, clickedIndex >= 0 else { return }
-        delegate?.tabBar(self, perform: action, on: clickedIndex)
-    }
-}
+/// Hand-drawn tab strip lives in `TabStripView` (Util/TabStripView.swift), shared
+/// with the terminal panel. Only the editor-specific menu commands stay here.
 
 extension FileIcons {
     /// The tab bar stores a symbol name, but we want the colour of the file it
@@ -328,7 +43,7 @@ extension FileIcons {
 
 final class EditorAreaController: NSViewController {
 
-    private let tabBar = EditorTabBar()
+    private let tabBar = TabStripView()
     private let container = NSView()
     private var contents: [EditorTabContent] = []
     private var currentIndex: Int = -1
@@ -352,6 +67,10 @@ final class EditorAreaController: NSViewController {
     var openFileURLs: [URL] {
         contents.compactMap { $0.tabURL }
     }
+
+    /// The shared tab strip. Exposed so tests can assert the editor and the
+    /// terminal really do use the same component.
+    var tabStripView: TabStripView { tabBar }
 
     // MARK: Lifecycle
 
@@ -396,11 +115,10 @@ final class EditorAreaController: NSViewController {
     // MARK: Tabs
 
     private func rebuildTabBar() {
-        tabBar.tabs = contents.map {
-            EditorTabBar.Tab(title: $0.tabTitle,
-                             dirty: $0.tabIsDirty,
-                             iconName: $0.tabIconName,
-                             isPinned: false)
+        tabBar.items = contents.map {
+            TabStripView.Item(title: $0.tabTitle,
+                              iconName: $0.tabIconName,
+                              showsDot: $0.tabIsDirty)
         }
         tabBar.selectedIndex = currentIndex
         tabBar.needsDisplay = true
@@ -634,13 +352,63 @@ final class EditorAreaController: NSViewController {
     }
 }
 
-extension EditorAreaController: EditorTabBarDelegate {
+extension EditorAreaController: TabStripViewDelegate {
 
-    func tabBar(_ bar: EditorTabBar, didSelect index: Int) { select(index) }
+    func tabStrip(_ strip: TabStripView, didSelect index: Int) { select(index) }
 
-    func tabBar(_ bar: EditorTabBar, didClose index: Int) { closeTab(at: index) }
+    func tabStrip(_ strip: TabStripView, didClose index: Int) { closeTab(at: index) }
 
-    func tabBar(_ bar: EditorTabBar, perform action: EditorTabAction, on index: Int) {
+    /// Build the context menu here rather than in the strip, so the shared view
+    /// stays ignorant of what a tab means.
+    func tabStrip(_ strip: TabStripView, menuFor index: Int) -> NSMenu? {
+        guard index >= 0, index < contents.count else { return nil }
+        let hasOthers = contents.count > 1
+        let hasRight = index < contents.count - 1
+        let entries: [(String, EditorTabAction, Bool)] = [
+            ("关闭", .close, true),
+            ("关闭其他标签页", .closeOthers, hasOthers),
+            ("关闭右侧标签页", .closeToRight, hasRight),
+            ("关闭所有标签页", .closeAll, hasOthers),
+            ("", .close, false),
+            ("复制完整路径", .copyPath, true),
+            ("在 Finder 中显示", .revealInFinder, true),
+            ("重新从磁盘加载", .reloadFromDisk, true),
+            ("在终端中打开所在目录", .openInTerminal, true)
+        ]
+        let menu = NSMenu()
+        for (title, action, enabled) in entries {
+            if title.isEmpty {
+                menu.addItem(.separator())
+                continue
+            }
+            let item = NSMenuItem(title: title,
+                                  action: #selector(editorTabMenuAction(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = EditorTabMenuPayload(action: action, index: index)
+            item.isEnabled = enabled
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    @objc private func editorTabMenuAction(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? EditorTabMenuPayload else { return }
+        performEditorTabAction(payload.action, on: payload.index)
+    }
+
+    /// `NSMenuItem.representedObject` has to be an object, so the enum plus the
+    /// index travel together in this box.
+    private final class EditorTabMenuPayload: NSObject {
+        let action: EditorTabAction
+        let index: Int
+        init(action: EditorTabAction, index: Int) {
+            self.action = action
+            self.index = index
+        }
+    }
+
+    func performEditorTabAction(_ action: EditorTabAction, on index: Int) {
         guard index >= 0, index < contents.count else { return }
         switch action {
         case .close:

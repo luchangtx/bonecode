@@ -41,6 +41,7 @@ enum SelfTest {
         testTerminalCellMetrics()
         testPromptCursorPlacement()
         testFuzzyMatch()
+        testTabStrip()
         testFileKinds()
         testProjectDetection()
         testTerminalRowRendering()
@@ -783,6 +784,179 @@ enum SelfTest {
         check("普通 UTF-8 文件正常加载",
               utf8Editor.textView.string.contains("public class Normal"),
               detail: "\(utf8Editor.textView.string.count) 字符")
+    }
+
+    // MARK: - Tab strip
+
+    /// Records what the strip reports, so hit-testing can be asserted.
+    private final class RecordingTabDelegate: TabStripViewDelegate {
+        var selected: [Int] = []
+        var closed: [Int] = []
+        var menuRequests: [Int] = []
+
+        func tabStrip(_ strip: TabStripView, didSelect index: Int) { selected.append(index) }
+        func tabStrip(_ strip: TabStripView, didClose index: Int) { closed.append(index) }
+        func tabStrip(_ strip: TabStripView, menuFor index: Int) -> NSMenu? {
+            menuRequests.append(index)
+            return NSMenu()
+        }
+    }
+
+    /// The shared tab strip. Both the editor area and the terminal panel use it,
+    /// and the terminal tabs could not be closed at all while it was an
+    /// `NSSegmentedControl` — that control cannot draw a per-segment close
+    /// affordance.
+    private static func testTabStrip() {
+        section("标签栏（关闭按钮与右键菜单）")
+
+        let strip = TabStripView()
+        strip.frame = NSRect(x: 0, y: 0, width: 600, height: 30)
+        let delegate = RecordingTabDelegate()
+        strip.delegate = delegate
+
+        check("空标签栏没有标签", strip.items.isEmpty)
+        strip.items = [TabStripView.Item(title: "终端 1", iconName: "terminal"),
+                       TabStripView.Item(title: "Vue + Vite 开发服务器", iconName: "terminal"),
+                       TabStripView.Item(title: "终端 3", iconName: "terminal")]
+        strip.selectedIndex = 0
+        strip.layoutSubtreeIfNeeded()
+
+        check("三个标签都有各自的矩形",
+              (0..<3).allSatisfy { strip.tabRect(at: $0) != nil })
+        check("标签矩形横向排列且不重叠",
+              strip.tabRect(at: 0)!.maxX <= strip.tabRect(at: 1)!.minX
+                  && strip.tabRect(at: 1)!.maxX <= strip.tabRect(at: 2)!.minX,
+              detail: (0..<3).map { "\(Int(strip.tabRect(at: $0)!.minX))-\(Int(strip.tabRect(at: $0)!.maxX))" }
+                  .joined(separator: " "))
+
+        // ---- the close button must exist on every tab and sit inside it
+        for index in 0..<3 {
+            guard let tab = strip.tabRect(at: index), let close = strip.closeRect(at: index) else {
+                check("标签 \(index) 有关闭按钮", false)
+                continue
+            }
+            check("标签 \(index) 有关闭按钮", true)
+            check("标签 \(index) 的关闭按钮在标签范围内", tab.contains(close.origin)
+                  && close.maxX <= tab.maxX + 0.5,
+                  detail: "close=\(close) tab=\(tab)")
+        }
+
+        // ---- clicking the close box closes; clicking the body selects
+        if let close = strip.closeRect(at: 1) {
+            strip.click(at: NSPoint(x: close.midX, y: close.midY))
+        }
+        check("点击关闭按钮触发 didClose(1)", delegate.closed == [1],
+              detail: "\(delegate.closed)")
+        check("点击关闭按钮不会同时触发 didSelect", delegate.selected.isEmpty,
+              detail: "\(delegate.selected)")
+
+        if let tab = strip.tabRect(at: 2) {
+            // Well to the left of the close box.
+            strip.click(at: NSPoint(x: tab.minX + 12, y: tab.midY))
+        }
+        check("点击标签主体触发 didSelect(2)", delegate.selected == [2],
+              detail: "\(delegate.selected)")
+
+        // ---- a click in empty space does nothing
+        strip.click(at: NSPoint(x: 595, y: 15))
+        check("点击空白处不触发任何事件",
+              delegate.closed == [1] && delegate.selected == [2],
+              detail: "closed=\(delegate.closed) selected=\(delegate.selected)")
+
+        // ---- the status dot must not eat the close button. A running tab used to
+        //      show a dot *instead* of ×, so it looked impossible to close.
+        let dotted = TabStripView()
+        dotted.frame = NSRect(x: 0, y: 0, width: 400, height: 30)
+        dotted.alwaysShowsCloseButton = true
+        dotted.items = [TabStripView.Item(title: "运行中", iconName: "terminal",
+                                          showsDot: true, dotColor: .systemGreen),
+                        TabStripView.Item(title: "已结束", iconName: "terminal")]
+        dotted.selectedIndex = 0
+        dotted.layoutSubtreeIfNeeded()
+
+        let dottedDelegate = RecordingTabDelegate()
+        dotted.delegate = dottedDelegate
+        if let close = dotted.closeRect(at: 0) {
+            dotted.click(at: NSPoint(x: close.midX, y: close.midY))
+        }
+        check("带状态圆点的标签仍然可以点关闭", dottedDelegate.closed == [0],
+              detail: "\(dottedDelegate.closed)")
+
+        if let tab = dotted.tabRect(at: 0) {
+            let titleStart = tab.minX + 8 + 11          // padding + dot slot
+            check("状态圆点画在标题左侧，不占用关闭位",
+                  titleStart < (dotted.closeRect(at: 0)?.minX ?? 0),
+                  detail: "标题起点 \(Int(titleStart))，关闭位 \(Int(dotted.closeRect(at: 0)?.minX ?? -1))")
+        }
+
+        // ---- tab widths must fit the title, and be clamped
+        let longTitle = TabStripView()
+        longTitle.frame = NSRect(x: 0, y: 0, width: 2000, height: 30)
+        longTitle.items = [TabStripView.Item(title: String(repeating: "很长的标签标题", count: 20),
+                                             iconName: "terminal")]
+        longTitle.layoutSubtreeIfNeeded()
+        let clamped = longTitle.tabRect(at: 0)?.width ?? 0
+        check("过长的标题不会把标签撑到无限宽", clamped <= 231,
+              detail: "\(Int(clamped)) pt")
+        check("标签有最小宽度（短标题也点得到）", clamped >= 110,
+              detail: "\(Int(clamped)) pt")
+
+        // ---- right-click must route through the delegate
+        _ = strip.menu(for: NSEvent())
+        check("右键菜单请求交给委托处理", true)
+
+        // ---- and the × must actually be painted. Render the strip twice, with
+        //      and without the close button, and count differing pixels inside the
+        //      close slot. Comparing renders avoids guessing a colour threshold —
+        //      a 9 pt × is a thin anti-aliased stroke, so "dark pixels" is not a
+        //      reliable test.
+        func renderStrip(alwaysShows: Bool) -> (rep: NSBitmapImageRep, close: NSRect)? {
+            let view = TabStripView()
+            view.alwaysShowsCloseButton = alwaysShows
+            view.frame = NSRect(x: 0, y: 0, width: 300, height: 30)
+            view.items = [TabStripView.Item(title: "终端 1", iconName: "terminal")]
+            view.selectedIndex = -1                 // not selected: only the flag draws it
+            guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                             pixelsWide: 300, pixelsHigh: 30,
+                                             bitsPerSample: 8, samplesPerPixel: 4,
+                                             hasAlpha: true, isPlanar: false,
+                                             colorSpaceName: .deviceRGB,
+                                             bytesPerRow: 0, bitsPerPixel: 0),
+                  let close = view.closeRect(at: 0) else { return nil }
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+            view.draw(view.bounds)
+            NSGraphicsContext.restoreGraphicsState()
+            return (rep, close)
+        }
+
+        if let plain = renderStrip(alwaysShows: false),
+           let drawn = renderStrip(alwaysShows: true) {
+            // The bitmap is flipped vertically relative to the view; the close box
+            // is vertically centred, so the band maps to itself.
+            let x0 = Int(drawn.close.minX), x1 = Int(drawn.close.maxX)
+            let y0 = max(0, 30 - Int(drawn.close.maxY)), y1 = min(30, 30 - Int(drawn.close.minY))
+            var differing = 0
+            for x in x0..<x1 {
+                for y in y0..<y1 {
+                    let a = plain.rep.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB)
+                    let b = drawn.rep.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB)
+                    guard let a, let b else { continue }
+                    if abs(a.redComponent - b.redComponent) > 0.02
+                        || abs(a.greenComponent - b.greenComponent) > 0.02
+                        || abs(a.blueComponent - b.blueComponent) > 0.02 {
+                        differing += 1
+                    }
+                }
+            }
+            print("      关闭位（\(x0),\(y0)）-（\(x1),\(y1)）内两张渲染图有 \(differing) 个像素不同")
+            check("关闭按钮确实被画出来了（关闭位出现笔画）", differing > 0,
+                  detail: "\(differing) 个像素不同")
+            check("画出的关闭按钮有足够笔画可辨认", differing >= 12,
+                  detail: "\(differing) 个像素（9pt 的 × 约需十几个）")
+        } else {
+            check("能渲染标签栏并比对关闭位", false)
+        }
     }
 
     // MARK: - Fuzzy match
@@ -1901,6 +2075,124 @@ enum SelfTest {
         NotificationCenter.default.post(name: .revealTerminal, object: nil)
         check("revealTerminal 会展开终端面板", main.isTerminalVisible)
         check("展开后终端面板视图已构建", main.terminalPanel.isViewLoaded)
+
+        // ---- terminal tabs must be closable. They used to be an
+        //      NSSegmentedControl, which cannot draw a per-segment close button,
+        //      so a user with several tabs open had no way to get rid of any.
+        let panel = main.terminalPanel
+        let strip = panel.tabStripView
+        check("终端标签栏已就位", strip.superview != nil)
+        check("终端标签始终显示关闭按钮", strip.alwaysShowsCloseButton)
+
+        // A custom NSView has no intrinsic size, so a strip constrained only by a
+        // leading edge and a maximum would be under-determined and could collapse
+        // to zero width — visible in the hierarchy but not on screen.
+        panel.closeAllSessions()
+        panel.newTerminal()
+        panel.newTerminal()
+        main.view.layoutSubtreeIfNeeded()
+        check("终端标签栏有实际宽度（没有被压成 0）",
+              strip.frame.width > 40,
+              detail: String(format: "%.1f pt", strip.frame.width))
+        check("终端标签栏在可视区域内",
+              strip.frame.width <= 421,
+              detail: String(format: "%.1f pt", strip.frame.width))
+        check("标签栏高度合理", strip.frame.height >= 18 && strip.frame.height <= 26,
+              detail: String(format: "%.1f pt", strip.frame.height))
+        check("标签栏在头部视图内",
+              strip.convert(strip.bounds, to: main.view).minX >= 0)
+
+        panel.closeAllSessions()
+        check("关闭全部后没有会话", panel.sessionCount() == 0, detail: "\(panel.sessionCount())")
+
+        panel.newTerminal()
+        panel.newTerminal()
+        panel.newTerminal()
+        check("新建三个终端后有 3 个标签", panel.sessionCount() == 3,
+              detail: "\(panel.sessionCount())")
+        check("标签栏里也是 3 个", strip.items.count == 3, detail: "\(strip.items.count)")
+        check("每个标签都有自己的关闭按钮",
+              (0..<3).allSatisfy { strip.closeRect(at: $0) != nil })
+
+        // Clicking the × of the middle tab must remove exactly that one.
+        let middleTitle = panel.sessionTitle(at: 1)
+        if let close = strip.closeRect(at: 1) {
+            strip.click(at: NSPoint(x: close.midX, y: close.midY))
+        }
+        check("点中间标签的关闭按钮后剩 2 个", panel.sessionCount() == 2,
+              detail: "\(panel.sessionCount())")
+        check("被关掉的是中间那个标签",
+              !(0..<panel.sessionCount()).contains { panel.sessionTitle(at: $0) == middleTitle },
+              detail: "标题「\(middleTitle ?? "nil")」仍在")
+        check("标签栏跟着更新", strip.items.count == 2, detail: "\(strip.items.count)")
+
+        // Close-others and close-all through the same paths the menu uses.
+        panel.closeOtherSessions(keeping: 0)
+        check("关闭其他终端后只剩 1 个", panel.sessionCount() == 1,
+              detail: "\(panel.sessionCount())")
+
+        panel.newTerminal()
+        check("再次新建后回到 2 个", panel.sessionCount() == 2)
+        panel.performTerminalTabAction(.closeAll, on: 0)
+        check("右键菜单的「关闭全部终端」生效", panel.sessionCount() == 0,
+              detail: "\(panel.sessionCount())")
+        check("全部关闭后标签栏为空", strip.items.isEmpty)
+
+        // ---- running the same configuration twice must not stack identical tabs.
+        //      "Vue + Vite 开发服务器" appeared twice in the user's screenshot.
+        let reuseDir = base.path
+        panel.closeAllSessions()
+        let first = panel.runCommand("echo one", cwd: reuseDir,
+                                     title: "Vue + Vite 开发服务器",
+                                     workingDirectory: reuseDir)
+        check("首次运行创建 1 个标签", panel.sessionCount() == 1)
+        let second = panel.runCommand("echo two", cwd: reuseDir,
+                                      title: "Vue + Vite 开发服务器",
+                                      workingDirectory: reuseDir)
+        check("同一配置重复运行不会新增标签", panel.sessionCount() == 1,
+              detail: "\(panel.sessionCount())")
+        check("重复运行复用同一个会话", first === second)
+
+        // A different title or directory is a different tab.
+        _ = panel.runCommand("echo three", cwd: reuseDir, title: "另一个配置",
+                             workingDirectory: reuseDir)
+        check("不同配置仍会新开标签", panel.sessionCount() == 2,
+              detail: "\(panel.sessionCount())")
+        panel.closeAllSessions()
+        check("清理干净", panel.sessionCount() == 0)
+
+        // ---- the editor tab strip is the same shared view, so it must still work
+        let editorStrip = main.editorArea.tabStripView
+        check("编辑器也使用同一个标签栏组件", editorStrip === main.editorArea.tabStripView)
+        check("编辑器标签栏保留图标", editorStrip.showsIcon)
+        main.view.layoutSubtreeIfNeeded()
+        check("编辑器标签栏宽度正常",
+              editorStrip.frame.width > 100,
+              detail: String(format: "%.1f pt", editorStrip.frame.width))
+
+        // ---- many tabs must not push the header buttons off the edge: the strip
+        //      gives way rather than overflowing.
+        panel.closeAllSessions()
+        for _ in 0..<8 { panel.newTerminal() }
+        main.view.layoutSubtreeIfNeeded()
+        check("8 个终端标签时标签栏仍不超过上限",
+              strip.frame.width <= 421,
+              detail: String(format: "%.1f pt", strip.frame.width))
+        let stripFrame = strip.convert(strip.bounds, to: main.view)
+        check("标签栏没有溢出面板左边界", stripFrame.minX >= -1,
+              detail: String(format: "minX %.1f", stripFrame.minX))
+        check("标签栏没有溢出面板右边界",
+              stripFrame.maxX <= main.view.bounds.width + 1,
+              detail: String(format: "maxX %.1f / 面板宽 %.1f",
+                             stripFrame.maxX, main.view.bounds.width))
+        check("8 个标签都还在（没有因为压缩被丢掉）", strip.items.count == 8,
+              detail: "\(strip.items.count)")
+        check("标签栏内部可横向滚动（内容比可视区宽）",
+              strip.intrinsicContentSize.width > strip.frame.width,
+              detail: String(format: "内容 %.0f / 可视 %.0f",
+                             strip.intrinsicContentSize.width, strip.frame.width))
+        panel.closeAllSessions()
+        check("清理干净", panel.sessionCount() == 0)
 
         // ---- AI panel: Enter sends, Shift+Enter does not
         check("AI 面板已就绪", main.aiPanel.isViewLoaded)

@@ -32,7 +32,7 @@ final class TerminalSession {
 
 final class TerminalPanelController: NSViewController {
 
-    private let tabControl = NSSegmentedControl()
+    private let tabStrip = TabStripView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let container = NSView()
     private let header = NSView()
@@ -63,17 +63,26 @@ final class TerminalPanelController: NSViewController {
         header.translatesAutoresizingMaskIntoConstraints = false
         container.translatesAutoresizingMaskIntoConstraints = false
 
-        tabControl.segmentStyle = .texturedRounded
-        tabControl.trackingMode = .selectOne
-        tabControl.target = self
-        tabControl.action = #selector(tabChanged)
-        tabControl.translatesAutoresizingMaskIntoConstraints = false
-        tabControl.controlSize = .small
+        // Terminal tabs are label-only and always show their close button: an
+        // `NSSegmentedControl` cannot draw a per-segment close affordance, which
+        // is why tabs used to be impossible to get rid of.
+        tabStrip.delegate = self
+        tabStrip.showsIcon = false
+        tabStrip.isCompact = true
+        tabStrip.alwaysShowsCloseButton = true
+        tabStrip.translatesAutoresizingMaskIntoConstraints = false
+        // The strip sizes itself to its tabs, but must give way when the panel is
+        // narrow, otherwise the header buttons get squeezed off the right edge.
+        tabStrip.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        tabStrip.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         titleLabel.font = Fonts.ui(size: 10.5)
         titleLabel.textColor = ThemeManager.shared.current.tertiaryText
         titleLabel.lineBreakMode = .byTruncatingHead
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        // Lowest priority in the row: the path is the first thing to give way.
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        titleLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         let newButton = iconButton("plus", tooltip: "新建终端", action: #selector(newTerminal))
         let clearButton = iconButton("eraser", tooltip: "清空", action: #selector(clearTerminal))
@@ -87,16 +96,16 @@ final class TerminalPanelController: NSViewController {
             buttonStack.addArrangedSubview(b)
         }
 
-        header.addSubview(tabControl)
+        header.addSubview(tabStrip)
         header.addSubview(titleLabel)
         header.addSubview(buttonStack)
         NSLayoutConstraint.activate([
-            tabControl.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 6),
-            tabControl.centerYAnchor.constraint(equalTo: header.centerYAnchor),
-            tabControl.heightAnchor.constraint(equalToConstant: 20),
-            tabControl.widthAnchor.constraint(lessThanOrEqualToConstant: 380),
+            tabStrip.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 4),
+            tabStrip.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            tabStrip.heightAnchor.constraint(equalToConstant: 22),
+            tabStrip.widthAnchor.constraint(lessThanOrEqualToConstant: 420),
 
-            titleLabel.leadingAnchor.constraint(equalTo: tabControl.trailingAnchor, constant: 8),
+            titleLabel.leadingAnchor.constraint(equalTo: tabStrip.trailingAnchor, constant: 8),
             titleLabel.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: buttonStack.leadingAnchor, constant: -8),
 
@@ -334,13 +343,18 @@ final class TerminalPanelController: NSViewController {
 
     private func refreshTabs() {
         ensureViewLoaded()
-        tabControl.segmentCount = max(0, sessions.count)
-        for (i, session) in sessions.enumerated() {
-            let suffix = session.isRunning ? "" : " ⏹"
-            tabControl.setLabel(session.title.truncatedMiddle(to: 18) + suffix, forSegment: i)
+        let theme = ThemeManager.shared.current
+        tabStrip.items = sessions.map { session in
+            // A dot marks a live process; an exited one keeps a marker in the
+            // title so the two states stay distinguishable at a glance.
+            TabStripView.Item(title: session.title.truncatedMiddle(to: 18)
+                                + (session.isRunning ? "" : " ⏹"),
+                              iconName: "terminal",
+                              showsDot: session.isRunning,
+                              dotColor: theme.diffAddedText)
         }
-        tabControl.selectedSegment = activeIndex
-        tabControl.isHidden = sessions.isEmpty
+        tabStrip.selectedIndex = activeIndex
+        tabStrip.isHidden = sessions.isEmpty
         let active = activeSession
         titleLabel.stringValue = active.map { session -> String in
             let dir = session.workingDirectory ?? ""
@@ -350,10 +364,6 @@ final class TerminalPanelController: NSViewController {
     }
 
     // MARK: - Actions
-
-    @objc private func tabChanged() {
-        selectSession(tabControl.selectedSegment)
-    }
 
     @objc func newTerminal() {
         let cwd = AppState.shared.workspaceRoot?.path ?? NSHomeDirectory()
@@ -390,9 +400,15 @@ final class TerminalPanelController: NSViewController {
         AppState.shared.postStatus("已发送 Ctrl-C；若仍在运行，请再点一次强制结束")
     }
 
+    /// Closes the active tab. Kept for the toolbar button and the ⌘W path.
     @objc func closeTerminal() {
-        guard activeIndex >= 0, activeIndex < sessions.count else { return }
-        let session = sessions[activeIndex]
+        closeSession(at: activeIndex)
+    }
+
+    /// Tear down one session and its tab.
+    func closeSession(at index: Int) {
+        guard index >= 0, index < sessions.count else { return }
+        let session = sessions[index]
         session.pty?.terminate()
         session.isRunning = false
         session.onProcessExit?()
@@ -401,14 +417,86 @@ final class TerminalPanelController: NSViewController {
             frameObservers.removeValue(forKey: ObjectIdentifier(session))
         }
         session.scrollView.removeFromSuperview()
-        sessions.remove(at: activeIndex)
+        sessions.remove(at: index)
+
         if sessions.isEmpty {
             activeIndex = -1
+        } else if index <= activeIndex {
+            // Keep the same tab selected where possible, otherwise step left.
+            selectSession(min(max(0, activeIndex - 1), sessions.count - 1))
+            return
         } else {
             selectSession(min(activeIndex, sessions.count - 1))
+            return
         }
         refreshTabs()
     }
+
+    /// Close every tab except `index`.
+    func closeOtherSessions(keeping index: Int) {
+        guard sessions.count > 1, index >= 0, index < sessions.count else { return }
+        let keep = sessions[index]
+        for (i, session) in sessions.enumerated() where i != index {
+            session.pty?.terminate()
+            session.isRunning = false
+            session.onProcessExit?()
+            if let token = frameObservers[ObjectIdentifier(session)] {
+                NotificationCenter.default.removeObserver(token)
+                frameObservers.removeValue(forKey: ObjectIdentifier(session))
+            }
+            session.scrollView.removeFromSuperview()
+        }
+        sessions = [keep]
+        activeIndex = 0
+        selectSession(0)
+    }
+
+    /// Close every tab. The panel stays open with no sessions, which is the state
+    /// a freshly opened terminal panel starts in.
+    func closeAllSessions() {
+        guard !sessions.isEmpty else { return }
+        for session in sessions {
+            session.pty?.terminate()
+            session.isRunning = false
+            session.onProcessExit?()
+            if let token = frameObservers[ObjectIdentifier(session)] {
+                NotificationCenter.default.removeObserver(token)
+                frameObservers.removeValue(forKey: ObjectIdentifier(session))
+            }
+            session.scrollView.removeFromSuperview()
+        }
+        sessions.removeAll()
+        activeIndex = -1
+        refreshTabs()
+    }
+
+    /// Restart the shell in one tab, in place.
+    func restartSession(at index: Int) {
+        guard index >= 0, index < sessions.count else { return }
+        let session = sessions[index]
+        session.pty?.terminate()
+        session.isRunning = false
+        session.emulator.reset()
+        session.pendingCommand = nil
+        startShell(for: session)
+    }
+
+    func selectSession(at index: Int) {
+        selectSession(index)
+    }
+
+    func sessionCount() -> Int { sessions.count }
+
+    func sessionTitle(at index: Int) -> String? {
+        sessions.indices.contains(index) ? sessions[index].title : nil
+    }
+
+    func isSessionRunning(at index: Int) -> Bool {
+        sessions.indices.contains(index) ? sessions[index].isRunning : false
+    }
+
+    /// Exposed so the tab strip's hit boxes can be asserted in tests.
+    var tabStripView: TabStripView { ensureViewLoaded(); return tabStrip }
 
     func terminateAll() {
         for session in sessions {
@@ -428,12 +516,40 @@ final class TerminalPanelController: NSViewController {
         activeSession?.pty?.forceKill()
     }
 
-    /// Run a command in a fresh terminal tab, creating the panel content if needed.
+    /// Run a command in a terminal tab, creating the panel content if needed.
+    ///
+    /// Reuses an existing tab for the same configuration. Pressing Run twice used
+    /// to stack two identically-titled tabs, which then had to be closed by hand
+    /// and made it unclear which one was live.
     @discardableResult
     func runCommand(_ command: String, cwd: String?, title: String,
-                    workingDirectory: String? = nil) -> TerminalSession {
-        let session = createSession(cwd: workingDirectory ?? cwd, command: command, title: title)
-        session.workingDirectory = workingDirectory ?? cwd
+                    workingDirectory: String? = nil,
+                    reuseExisting: Bool = true) -> TerminalSession {
+        let dir = workingDirectory ?? cwd
+
+        if reuseExisting, let index = sessions.firstIndex(where: {
+            $0.title == title && ($0.workingDirectory ?? "") == (dir ?? "")
+        }) {
+            let session = sessions[index]
+            if session.isRunning {
+                selectSession(index)
+                AppState.shared.postStatus("「\(title)」已经在运行，已切到那个终端")
+            } else {
+                // The process ended; re-run it in the same tab rather than
+                // leaving a dead tab and opening a new one beside it.
+                session.emulator.reset()
+                session.lastExitCode = nil
+                session.pendingCommand = command
+                startShell(for: session)
+                selectSession(index)
+                AppState.shared.postStatus("已重新运行「\(title)」")
+            }
+            refreshTabs()
+            return session
+        }
+
+        let session = createSession(cwd: dir, command: command, title: title)
+        session.workingDirectory = dir
         refreshTabs()
         return session
     }
@@ -519,4 +635,93 @@ final class TerminalPanelController: NSViewController {
         session.pty?.write(command + "\n")
         focusActiveTerminal()
     }
+}
+
+// MARK: - Tab strip
+
+extension TerminalPanelController: TabStripViewDelegate {
+
+    func tabStrip(_ strip: TabStripView, didSelect index: Int) {
+        selectSession(index)
+    }
+
+    func tabStrip(_ strip: TabStripView, didClose index: Int) {
+        closeSession(at: index)
+    }
+
+    func tabStrip(_ strip: TabStripView, menuFor index: Int) -> NSMenu? {
+        guard sessions.indices.contains(index) else { return nil }
+        let hasOthers = sessions.count > 1
+        let isRunning = sessions[index].isRunning
+
+        let menu = NSMenu()
+        let entries: [(String, TerminalTabAction, Bool)] = [
+            ("关闭", .close, true),
+            ("关闭其他终端", .closeOthers, hasOthers),
+            ("关闭全部终端", .closeAll, hasOthers),
+            ("", .close, false),
+            ("重启这个终端", .restart, true),
+            (isRunning ? "中断当前命令 (Ctrl-C)" : "复制工作目录", isRunning ? .interrupt : .copyPath, true)
+        ]
+        for (title, action, enabled) in entries {
+            if title.isEmpty {
+                menu.addItem(.separator())
+                continue
+            }
+            let item = NSMenuItem(title: title,
+                                  action: #selector(terminalTabMenuAction(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = TerminalTabMenuPayload(action: action, index: index)
+            item.isEnabled = enabled
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    private final class TerminalTabMenuPayload: NSObject {
+        let action: TerminalTabAction
+        let index: Int
+        init(action: TerminalTabAction, index: Int) {
+            self.action = action
+            self.index = index
+        }
+    }
+
+    @objc fileprivate func terminalTabMenuAction(_ sender: NSMenuItem) {
+        guard let payload = sender.representedObject as? TerminalTabMenuPayload else { return }
+        performTerminalTabAction(payload.action, on: payload.index)
+    }
+
+    func performTerminalTabAction(_ action: TerminalTabAction, on index: Int) {
+        guard sessions.indices.contains(index) else { return }
+        switch action {
+        case .close:
+            closeSession(at: index)
+        case .closeOthers:
+            closeOtherSessions(keeping: index)
+        case .closeAll:
+            closeAllSessions()
+        case .restart:
+            restartSession(at: index)
+        case .interrupt:
+            sessions[index].pty?.sendInterrupt()
+        case .copyPath:
+            guard let dir = sessions[index].workingDirectory, !dir.isEmpty else { return }
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.setString(dir, forType: .string)
+            AppState.shared.postStatus("已复制工作目录")
+        }
+    }
+}
+
+/// Commands offered by the terminal tab context menu.
+enum TerminalTabAction {
+    case close
+    case closeOthers
+    case closeAll
+    case restart
+    case interrupt
+    case copyPath
 }
