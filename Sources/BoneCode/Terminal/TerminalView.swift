@@ -100,6 +100,10 @@ final class TerminalView: NSView, NSTextInputClient {
     let emulator: TerminalEmulator
 
     var onInput: ((Data) -> Void)?
+    /// Reports the new (cols, rows) after the visible size changed, so the
+    /// process behind the pty can be told. Without this the shell keeps wrapping
+    /// at its old width and the cursor drifts away from the text.
+    var onResize: ((Int, Int) -> Void)?
     var onTitleChange: ((String) -> Void)?
     var onBell: (() -> Void)?
     var onFontSizeChange: ((CGFloat) -> Void)?
@@ -108,7 +112,7 @@ final class TerminalView: NSView, NSTextInputClient {
         didSet {
             guard fontSize != oldValue else { return }
             rebuildFonts()
-            syncFrame()
+            updateSizeFromScrollView()      // cell size changed, so cols/rows did too
             needsDisplay = true
         }
     }
@@ -176,14 +180,18 @@ final class TerminalView: NSView, NSTextInputClient {
 
     // MARK: - Geometry
 
-    /// Recompute cols/rows from the visible size and tell the emulator + PTY.
+    /// Recompute cols/rows from the visible size and tell the emulator *and* the
+    /// process behind the pty. Both must agree, or the shell's line wrapping and
+    /// the grid diverge and the cursor ends up in the wrong column.
     func updateSizeFromScrollView() {
         guard let sv = enclosingScrollView else { return }
         let size = sv.contentSize
         let cols = max(20, Int(size.width / cellWidth))
         let rows = max(4, Int(size.height / cellHeight))
+        let changed = cols != emulator.cols || rows != emulator.rows
         emulator.resize(cols: cols, rows: rows)
         syncFrame()
+        if changed { onResize?(cols, rows) }
     }
 
     func syncFrame() {

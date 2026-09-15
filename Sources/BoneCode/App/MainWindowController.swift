@@ -62,12 +62,70 @@ final class StatusBarView: NSView {
     func setLanguage(_ text: String) { languageLabel.stringValue = text }
 }
 
+// MARK: - Split view that stays inside the window
+
+/// `NSSplitViewController` sizes its items by each item's preferred width and
+/// will happily let the total exceed the window, which clips the rightmost panel
+/// at the window edge — it reads as "the content is being covered up".
+///
+/// This clamps the divider positions on every layout pass: only when the items
+/// would overflow, so normal dragging is untouched.
+final class ConstrainedSplitViewController: NSSplitViewController {
+
+    private var isClamping = false
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        clampDividers()
+    }
+
+    private func clampDividers() {
+        guard !isClamping else { return }
+        let split = splitView
+        let items = splitViewItems
+        guard items.count >= 2 else { return }
+
+        let extent = split.isVertical ? split.bounds.width : split.bounds.height
+        guard extent > 1 else { return }
+
+        let minimums = items.map { max($0.minimumThickness, 60) }
+        guard minimums.reduce(0, +) <= extent else { return }   // impossible; let AppKit squeeze
+
+        // Measure the current sizes from the laid-out subviews.
+        var widths = split.arrangedSubviews.map {
+            split.isVertical ? $0.frame.width : $0.frame.height
+        }
+        guard widths.count == items.count else { return }
+
+        var overflow = widths.reduce(0, +) - extent
+        guard overflow > 0.5 else { return }        // already fits
+
+        // Shrink the widest panel that still has slack, repeatedly.
+        while overflow > 0.5 {
+            let candidates = widths.indices.filter { widths[$0] - minimums[$0] > 0.5 }
+            guard let widest = candidates.max(by: { widths[$0] < widths[$1] }) else { break }
+            let slack = widths[widest] - minimums[widest]
+            let take = min(slack, overflow)
+            widths[widest] -= take
+            overflow -= take
+        }
+
+        isClamping = true
+        var position: CGFloat = 0
+        for index in 0..<(widths.count - 1) {
+            position += widths[index]
+            split.setPosition(position, ofDividerAt: index)
+        }
+        isClamping = false
+    }
+}
+
 // MARK: - Main view controller
 
 final class MainViewController: NSViewController {
 
-    let outerSplit = NSSplitViewController()
-    let centerSplit = NSSplitViewController()
+    let outerSplit = ConstrainedSplitViewController()
+    let centerSplit = ConstrainedSplitViewController()
 
     let sidebar = SidebarViewController()
     let editorArea = EditorAreaController()
@@ -86,6 +144,8 @@ final class MainViewController: NSViewController {
     weak var toolbarRunButton: NSButton?
     weak var toolbarStopButton: NSButton?
     weak var toolbarRunStatusLabel: NSTextField?
+    weak var toolbarTerminalButton: HoverIconButton?
+    weak var toolbarAIButton: HoverIconButton?
 
     override func loadView() {
         let root = NSView()
@@ -279,6 +339,7 @@ final class MainViewController: NSViewController {
         } else if !terminalItem.isCollapsed && (note.object as? String) != "show" {
             terminalItem.animator().isCollapsed = true
         }
+        updatePanelToggleStates()
     }
 
     /// Expand the terminal without animation and lay it out immediately, so the
@@ -288,11 +349,13 @@ final class MainViewController: NSViewController {
             terminalItem.isCollapsed = false
         }
         view.layoutSubtreeIfNeeded()
+        updatePanelToggleStates()
     }
 
     @objc private func handleToggleAI() {
         aiItem.animator().isCollapsed.toggle()
         if !aiItem.isCollapsed { aiPanel.focusInput() }
+        updatePanelToggleStates()
     }
 
     @objc private func handleToggleSidebar() {
@@ -309,6 +372,11 @@ final class MainViewController: NSViewController {
         refreshStatusBar()
         updateRunControls()
         hardenPanelBackgrounds()
+        // Toolbar buttons live outside the controller's view hierarchy.
+        for item in view.window?.toolbar?.items ?? [] {
+            (item.view as? HoverIconButton)?.refreshAppearance()
+        }
+        view.refreshHoverButtons()
     }
 
     /// Re-assert an opaque background on every panel root. Belt and braces: the
@@ -398,6 +466,14 @@ final class MainViewController: NSViewController {
         }
         toolbarRunStatusLabel?.stringValue = running ? "● 运行中" : ""
         toolbarRunStatusLabel?.textColor = theme.diffAddedText
+        updatePanelToggleStates()
+    }
+
+    /// Show which side panels are currently open, so the toolbar toggles read as
+    /// state rather than as plain buttons.
+    func updatePanelToggleStates() {
+        toolbarTerminalButton?.isActive = isTerminalVisible
+        toolbarAIButton?.isActive = !aiItem.isCollapsed
     }
 
     func refreshToolbarRunMenu() {
@@ -521,17 +597,9 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
         let vc = mainViewController
 
         func button(_ symbol: String, _ tooltip: String, _ action: Selector,
-                    tint: NSColor? = nil, capture: ((NSButton) -> Void)? = nil) {
-            let b = NSButton(title: "", target: vc, action: action)
-            b.isBordered = false
-            b.bezelStyle = .inline
-            b.image = Icons.symbol(symbol, size: 15)
-            b.imageScaling = .scaleProportionallyDown
-            b.contentTintColor = tint ?? ThemeManager.shared.current.secondaryText
-            b.toolTip = tooltip
-            b.translatesAutoresizingMaskIntoConstraints = false
-            b.widthAnchor.constraint(equalToConstant: 26).isActive = true
-            b.heightAnchor.constraint(equalToConstant: 22).isActive = true
+                    tint: NSColor? = nil, capture: ((HoverIconButton) -> Void)? = nil) {
+            let b = HoverIconButton(symbol: symbol, tooltip: tooltip,
+                                    target: vc, action: action, tint: tint)
             item.view = b
             capture?(b)
         }
@@ -590,11 +658,15 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
             button("magnifyingglass", "在项目中搜索 (⌘⇧F)", #selector(MainViewController.showProjectSearch))
         case ItemID.terminal:
             item.label = "终端"
-            button("terminal", "切换终端 (⌘`)", #selector(MainViewController.toggleTerminalAction))
+            button("terminal", "切换终端 (⌘`)", #selector(MainViewController.toggleTerminalAction)) { [weak vc] b in
+                vc?.toolbarTerminalButton = b
+            }
         case ItemID.ai:
             item.label = "AI 助手"
             button("sparkles", "AI 助手 (⌘⇧A)", #selector(MainViewController.toggleAIAction),
-                   tint: ThemeManager.shared.current.accent)
+                   tint: ThemeManager.shared.current.accent) { [weak vc] b in
+                vc?.toolbarAIButton = b
+            }
         case ItemID.theme:
             item.label = "主题"
             button("circle.lefthalf.filled", "切换浅色/深色主题", #selector(MainViewController.toggleTheme))

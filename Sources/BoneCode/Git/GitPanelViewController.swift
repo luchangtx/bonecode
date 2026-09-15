@@ -241,18 +241,8 @@ final class GitPanelViewController: NSViewController {
     }
 
     private func makeButton(_ symbol: String, tooltip: String, action: Selector) -> NSButton {
-        let button = NSButton(title: "", target: self, action: action)
-        button.isBordered = false
-        button.bezelStyle = .inline
-        button.toolTip = tooltip
-        button.image = Icons.symbol(symbol, size: 12.5)
-        button.contentTintColor = ThemeManager.shared.current.secondaryText
-        button.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            button.widthAnchor.constraint(equalToConstant: 24),
-            button.heightAnchor.constraint(equalToConstant: 22)
-        ])
-        return button
+        HoverIconButton(symbol: symbol, tooltip: tooltip, target: self, action: action,
+                        width: 24, height: 22, symbolSize: 12.5)
     }
 
     private func smallButton(_ title: String, _ action: Selector) -> NSButton {
@@ -275,6 +265,7 @@ final class GitPanelViewController: NSViewController {
         outputView.backgroundColor = theme.editorBackground
         outputView.textColor = theme.secondaryText
         syncLabel.textColor = theme.tertiaryText
+        view.refreshHoverButtons()
     }
 
     // MARK: - Data

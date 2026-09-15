@@ -908,13 +908,12 @@ final class WelcomeView: NSView {
             column.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -16)
         ])
 
-        // Fixed widths, but at a priority that yields when the editor area is
-        // narrow — otherwise they set a hard floor on the whole centre column.
-        for constraint in [buttonRow.widthAnchor.constraint(equalToConstant: 300),
-                           recentStack.widthAnchor.constraint(equalToConstant: 360)] {
-            constraint.priority = .defaultHigh
-            constraint.isActive = true
-        }
+        // Fixed widths, required. Combined with a low compression resistance on
+        // the row titles below, a long file name truncates instead of stretching
+        // the recent list — and with it the whole centre column, which used to
+        // push the right-hand panel off the edge of the window.
+        buttonRow.widthAnchor.constraint(equalToConstant: 300).isActive = true
+        recentStack.widthAnchor.constraint(equalToConstant: 360).isActive = true
 
         applyTheme()
         reloadRecent()
@@ -973,6 +972,10 @@ final class WelcomeView: NSView {
                 .foregroundColor: theme.tertiaryText
             ]))
             button.attributedTitle = title
+            // A long file name must truncate, not widen the list. Without this
+            // the title's intrinsic width wins and the whole column grows.
+            button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            button.cell?.lineBreakMode = .byTruncatingMiddle
 
             button.translatesAutoresizingMaskIntoConstraints = false
             recentStack.addArrangedSubview(button)
@@ -987,6 +990,7 @@ final class WelcomeView: NSView {
         let button = NSButton(title: " " + title, target: self, action: action)
         button.bezelStyle = .rounded
         button.font = Fonts.ui(size: 12, weight: .medium)
+        button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         if let image = Icons.symbol(symbol, size: 12) {
             button.image = image
             button.imagePosition = .imageLeading

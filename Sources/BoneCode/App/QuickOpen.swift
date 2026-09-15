@@ -34,6 +34,9 @@ final class QuickOpenController: NSObject {
     private var searchResults: [SearchHit] = []
     private var searchWorkItem: DispatchWorkItem?
     private var lastQuery = ""
+    private var resignObserver: NSObjectProtocol?
+    private var localClickMonitor: Any?
+    private var globalClickMonitor: Any?
 
     override init() {
         super.init()
@@ -194,9 +197,55 @@ final class QuickOpenController: NSObject {
         }
         panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(searchField)
+        installDismissObservers(for: panel)
+    }
+
+    /// Close as soon as focus or a click goes anywhere else.
+    ///
+    /// The resign-key observer handles clicks inside the app; the global monitor
+    /// covers clicks on another app or the desktop, which never reach us as an
+    /// event but do take key status away.
+    private func installDismissObservers(for panel: NSPanel) {
+        removeDismissObservers()
+
+        resignObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification,
+            object: panel,
+            queue: .main
+        ) { [weak self] _ in
+            self?.close()
+        }
+
+        localClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) {
+            [weak self] event in
+            guard let self, let current = self.panel, event.window !== current else { return event }
+            self.close()
+            return event
+        }
+
+        globalClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) {
+            [weak self] _ in
+            self?.close()
+        }
+    }
+
+    private func removeDismissObservers() {
+        if let resignObserver {
+            NotificationCenter.default.removeObserver(resignObserver)
+            self.resignObserver = nil
+        }
+        if let localClickMonitor {
+            NSEvent.removeMonitor(localClickMonitor)
+            self.localClickMonitor = nil
+        }
+        if let globalClickMonitor {
+            NSEvent.removeMonitor(globalClickMonitor)
+            self.globalClickMonitor = nil
+        }
     }
 
     func close() {
+        removeDismissObservers()
         panel?.orderOut(nil)
         AppState.shared.mainWindow?.makeKeyAndOrderFront(nil)
     }

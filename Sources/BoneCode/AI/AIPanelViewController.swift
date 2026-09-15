@@ -63,22 +63,28 @@ final class AIPanelViewController: NSViewController {
         ])
 
         // ---- quick actions
-        quickStack.orientation = .horizontal
+        // Two rows of two. A single row of four cannot fit once the panel is
+        // narrow, and a button that overflows its superview is still *visible*
+        // but no longer clickable — which reads exactly like "the button is
+        // broken". Wrapping keeps every action reachable.
+        quickStack.orientation = .vertical
         quickStack.spacing = 4
-        quickStack.alignment = .centerY
+        quickStack.alignment = .leading
         quickStack.translatesAutoresizingMaskIntoConstraints = false
-        for (title, selector) in [
-            ("解释代码", #selector(quickExplain)),
-            ("找 Bug", #selector(quickBugs)),
-            ("写测试", #selector(quickTests)),
-            ("审查改动", #selector(quickReviewDiff))
-        ] {
-            let button = NSButton(title: title, target: self, action: selector)
-            button.bezelStyle = .rounded
-            button.controlSize = .small
-            button.font = Fonts.ui(size: 10)
-            button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-            quickStack.addArrangedSubview(button)
+        for row in [[("解释代码", #selector(quickExplain)), ("找 Bug", #selector(quickBugs))],
+                    [("写测试", #selector(quickTests)), ("审查改动", #selector(quickReviewDiff))]] {
+            let rowStack = NSStackView.horizontal(spacing: 4)
+            rowStack.distribution = .fillEqually
+            for (title, selector) in row {
+                let button = NSButton(title: title, target: self, action: selector)
+                button.bezelStyle = .rounded
+                button.controlSize = .small
+                button.font = Fonts.ui(size: 10)
+                button.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                rowStack.addArrangedSubview(button)
+            }
+            quickStack.addArrangedSubview(rowStack)
+            rowStack.widthAnchor.constraint(equalTo: quickStack.widthAnchor).isActive = true
         }
 
         // ---- transcript
@@ -176,8 +182,9 @@ final class AIPanelViewController: NSViewController {
             header.heightAnchor.constraint(equalToConstant: 30),
 
             quickStack.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 8),
+            quickStack.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -8),
             quickStack.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 2),
-            quickStack.heightAnchor.constraint(equalToConstant: 22),
+            quickStack.heightAnchor.constraint(equalToConstant: 48),
 
             transcriptScroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             transcriptScroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
@@ -240,22 +247,13 @@ final class AIPanelViewController: NSViewController {
         inputView.backgroundColor = theme.editorBackground
         inputView.textColor = theme.text
         inputView.insertionPointColor = theme.caretColor
+        view.refreshHoverButtons()
         refreshModelLabel()
     }
 
     private func iconButton(_ symbol: String, _ tooltip: String, _ action: Selector) -> NSButton {
-        let button = NSButton(title: "", target: self, action: action)
-        button.isBordered = false
-        button.bezelStyle = .inline
-        button.toolTip = tooltip
-        button.image = Icons.symbol(symbol, size: 12)
-        button.contentTintColor = ThemeManager.shared.current.secondaryText
-        button.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            button.widthAnchor.constraint(equalToConstant: 22),
-            button.heightAnchor.constraint(equalToConstant: 20)
-        ])
-        return button
+        HoverIconButton(symbol: symbol, tooltip: tooltip, target: self, action: action,
+                        width: 22, height: 20, symbolSize: 12)
     }
 
     private func refreshModelLabel() {
@@ -315,7 +313,10 @@ final class AIPanelViewController: NSViewController {
 
     @objc private func sendMessage() {
         let text = inputView.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty else {
+            appendNotice("请先输入内容再发送。", isError: false)
+            return
+        }
         guard AIService.shared.isConfigured else {
             presentNotConfigured()
             return
@@ -461,13 +462,13 @@ final class AIPanelViewController: NSViewController {
     @objc private func applyReplaceSelection() {
         guard let code = codeToApply() else { return }
         guard let editor = AppState.shared.editorArea?.currentCodeEditor else {
-            AppState.shared.postStatus("没有打开的文件可以应用")
+            appendNotice("没有打开的文件可以应用这段代码。")
             return
         }
         let textView = editor.textView!
         let range = textView.selectedRange()
         guard range.length > 0 else {
-            AppState.shared.postStatus("请先在编辑器里选中要替换的内容")
+            appendNotice("请先在编辑器里选中要替换的内容，再点「替换选中内容」。")
             return
         }
         guard textView.shouldChangeText(in: range, replacementString: code) else { return }
@@ -482,7 +483,7 @@ final class AIPanelViewController: NSViewController {
     @objc private func applyInsertAtCursor() {
         guard let code = codeToApply() else { return }
         guard let editor = AppState.shared.editorArea?.currentCodeEditor else {
-            AppState.shared.postStatus("没有打开的文件可以应用")
+            appendNotice("没有打开的文件可以插入代码。")
             return
         }
         let textView = editor.textView!
@@ -512,10 +513,24 @@ final class AIPanelViewController: NSViewController {
             return nil
         }
         guard let target = AppState.shared.editableTarget() else {
-            AppState.shared.postStatus("请先打开一个文件")
+            appendNotice("请先在编辑器里打开一个文件，再使用这个动作。")
             return nil
         }
         return target
+    }
+
+    /// Report why an action could not run, inline in the transcript. A message
+    /// that only appears in the status bar is easy to miss and makes the button
+    /// look dead.
+    func appendNotice(_ message: String, isError: Bool = true) {
+        let theme = ThemeManager.shared.current
+        let storage = transcriptView.textStorage!
+        storage.append(NSAttributedString(string: "\n" + message + "\n", attributes: [
+            .font: Fonts.ui(size: 11.5),
+            .foregroundColor: isError ? theme.diffRemovedText : theme.secondaryText
+        ]))
+        transcriptView.scrollToEndOfDocument(nil)
+        AppState.shared.postStatus(message)
     }
 
     private func run(promptTitle: String, start: @escaping (String, String) -> Void) {
@@ -596,7 +611,7 @@ final class AIPanelViewController: NSViewController {
             return
         }
         guard GitService.shared.isOpen else {
-            AppState.shared.postStatus("当前不是 Git 仓库")
+            appendNotice("当前项目不是 Git 仓库，无法审查改动。")
             return
         }
         hideApplyBar()

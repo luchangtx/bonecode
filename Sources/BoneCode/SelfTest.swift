@@ -43,6 +43,7 @@ enum SelfTest {
         testTerminalRowRendering()
         testEditorLayoutStability()
         testPanelTheming()
+        testPanelBounds()
         testGitLayer()
         testPTYEndToEnd()
 
@@ -902,6 +903,46 @@ enum SelfTest {
             check("段落样式存在", false)
         }
 
+    }
+
+    // MARK: - Panel bounds
+
+    /// Every panel must sit fully inside the window at both a small and a
+    /// maximised-ish size. A panel that overflows gets clipped at the window
+    /// edge, which reads as "the content is being covered up".
+    private static func testPanelBounds() {
+        section("面板边界（最大化时是否有内容被裁掉）")
+
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
+        let controller = MainViewController()
+        _ = controller.view
+
+        for size in [NSSize(width: 900, height: 560), NSSize(width: 2560, height: 1400)] {
+            controller.view.frame = NSRect(origin: .zero, size: size)
+            // Setting .frame alone does not necessarily schedule a layout pass;
+            // without this the children keep their previous geometry and the
+            // measurements below are meaningless.
+            controller.view.needsLayout = true
+            controller.view.layoutSubtreeIfNeeded()
+            let bounds = controller.view.bounds
+            for (name, view) in [("侧边栏", controller.sidebar.view),
+                                 ("编辑器区域", controller.editorArea.view),
+                                 ("AI 面板", controller.aiPanel.view),
+                                 ("状态栏", controller.statusBar)] {
+                let frame = view.convert(view.bounds, to: controller.view)
+                let inside = bounds.insetBy(dx: -1, dy: -1).contains(frame)
+                check("\(Int(size.width))×\(Int(size.height))：\(name) 完整落在窗口内", inside,
+                      detail: String(format: "frame=(%.0f, %.0f, %.0f, %.0f) 窗口=%.0f×%.0f",
+                                     frame.minX, frame.minY, frame.width, frame.height,
+                                     bounds.width, bounds.height))
+            }
+
+            // The centre column must never be squeezed out of existence.
+            let centreWidth = controller.editorArea.view.frame.width
+            check("\(Int(size.width))×\(Int(size.height))：中央编辑区宽度合理",
+                  centreWidth >= 200, detail: "\(Int(centreWidth)) pt")
+        }
     }
 
     // MARK: - Panel theming

@@ -198,21 +198,12 @@ final class TerminalPanelController: NSViewController {
             session.scrollView.backgroundColor = theme.terminalBackground
             session.terminalView.needsDisplay = true
         }
+        view.refreshHoverButtons()
     }
 
     private func iconButton(_ symbol: String, tooltip: String, action: Selector) -> NSButton {
-        let button = NSButton(title: "", target: self, action: action)
-        button.isBordered = false
-        button.bezelStyle = .inline
-        button.toolTip = tooltip
-        button.image = Icons.symbol(symbol, size: 12)
-        button.contentTintColor = ThemeManager.shared.current.secondaryText
-        button.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([
-            button.widthAnchor.constraint(equalToConstant: 24),
-            button.heightAnchor.constraint(equalToConstant: 20)
-        ])
-        return button
+        HoverIconButton(symbol: symbol, tooltip: tooltip, target: self, action: action,
+                        width: 24, height: 20, symbolSize: 12)
     }
 
     /// The terminal panel starts collapsed, and NSSplitViewController does not
@@ -234,6 +225,9 @@ final class TerminalPanelController: NSViewController {
 
         session.terminalView.onInput = { [weak session] data in
             session?.pty?.write(data)
+        }
+        session.terminalView.onResize = { [weak session] cols, rows in
+            session?.pty?.resize(cols: cols, rows: rows)
         }
         session.terminalView.onTitleChange = { [weak self, weak session] newTitle in
             guard let session else { return }

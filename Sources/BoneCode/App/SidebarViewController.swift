@@ -69,6 +69,7 @@ final class SidebarViewController: NSViewController {
 
     @objc private func themeChanged() {
         view.setBackground(ThemeManager.shared.current.sidebarBackground)
+        view.refreshHoverButtons()
     }
 
     @objc private func sectionChanged() {
