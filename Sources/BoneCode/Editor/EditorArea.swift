@@ -844,8 +844,13 @@ final class RecentProjects {
         guard let raw = UserDefaults.standard.array(forKey: key) as? [[String: Any]] else { return }
         recentItems = raw.compactMap { dict in
             guard let path = dict["path"] as? String else { return nil }
+            // Filter on load as well as on push: a list written by an older build
+            // may already contain temp paths, and this lets it clean itself up on
+            // the next launch instead of waiting for them to age out.
+            guard !RecentProjects.isTemporary(path) else { return nil }
             return RecentItem(path: path, isDirectory: (dict["dir"] as? Bool) ?? false)
         }
+        if recentItems.count != raw.count { persist() }
     }
 
     private func persist() {
@@ -854,10 +859,38 @@ final class RecentProjects {
     }
 
     private func push(_ item: RecentItem) {
+        guard !RecentProjects.isTemporary(item.path) else { return }
         recentItems.removeAll { $0.path == item.path }
         recentItems.insert(item, at: 0)
         if recentItems.count > 12 { recentItems = Array(recentItems.prefix(12)) }
         persist()
+    }
+
+    /// Whether a path lives somewhere ephemeral.
+    ///
+    /// Temporary files are not worth remembering — they are gone by the next
+    /// launch, so they only push real projects out of the list. This also stops
+    /// automated runs, which open fixtures under the temp directory, from filling
+    /// the user's list with paths like `/var/folders/…/bonecode-ui-…/Demo.java`.
+    ///
+    /// These places are reachable by more than one name — the per-user temp
+    /// directory is `/var/folders/…` but resolves to `/private/var/folders/…`, and
+    /// `/tmp` resolves to `/private/tmp` — so every root is kept in both forms and
+    /// compared against the candidate in both forms.
+    ///
+    /// Resolving *both* sides is not an option: a path being recorded may not exist
+    /// yet, and `realpath` on a missing path leaves the symlinked prefix alone, so
+    /// `realPath("/tmp/new.txt")` stays `/tmp/new.txt` while `realPath("/tmp")`
+    /// becomes `/private/tmp` — the two would never match.
+    static func isTemporary(_ path: String) -> Bool {
+        guard !path.isEmpty else { return false }
+        let rawRoots = [FileManager.default.temporaryDirectory.path, "/tmp"]
+            .filter { !$0.isEmpty }
+        let roots = rawRoots + rawRoots.map { PathNormalizer.realPath($0) }
+        let candidates = [path, PathNormalizer.realPath(path)]
+        return roots.contains { root in
+            !root.isEmpty && candidates.contains { $0 == root || $0.hasPrefix(root + "/") }
+        }
     }
 
     func noteFolder(_ url: URL) { push(RecentItem(path: url.path, isDirectory: true)) }

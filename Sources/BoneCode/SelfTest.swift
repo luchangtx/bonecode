@@ -56,6 +56,7 @@ enum SelfTest {
         testWelcomeShortcutLayout()
         testFileTreeRootNode()
         testCommitBusyState()
+        testRecentProjectsIgnoresTemporaryPaths()
         testPTYEndToEnd()
 
         return finish()
@@ -1994,6 +1995,57 @@ enum SelfTest {
         check("提交失败后进度提示消失", !showsBusyMessage(), detail: statusText())
         check("提交失败时保留提交信息（否则白写了）",
               view.commitMessage == "chore: 失败也要解锁", detail: view.commitMessage)
+    }
+
+    // MARK: - Recent projects
+
+    /// Regression: running the self-test filled the user's "最近打开" list with
+    /// fixture paths from the temp directory, pushing their real projects out.
+    ///
+    /// The list keeps only 12 entries, so a handful of test runs was enough to
+    /// bury every genuine project under `/var/folders/…/bonecode-ui-…/`.
+    private static func testRecentProjectsIgnoresTemporaryPaths() {
+        section("最近打开不记录临时文件（回归：测试污染用户列表）")
+
+        let fm = FileManager.default
+        check("系统临时目录下的文件不记录",
+              RecentProjects.isTemporary(
+                fm.temporaryDirectory.appendingPathComponent("bonecode-ui-x/Demo.java").path))
+        check("系统临时目录本身不记录",
+              RecentProjects.isTemporary(fm.temporaryDirectory.path))
+        check("/tmp 形式也能识别（与系统临时目录是不同的位置）",
+              RecentProjects.isTemporary("/tmp/bonecode-ui-x/Demo.java"),
+              detail: "realPath: \(PathNormalizer.realPath("/tmp/bonecode-ui-x/Demo.java"))")
+        check("真实项目路径会被记录",
+              !RecentProjects.isTemporary(fm.homeDirectoryForCurrentUser.path),
+              detail: fm.homeDirectoryForCurrentUser.path)
+        check("应用目录会被记录", !RecentProjects.isTemporary("/Applications"))
+        check("名字里带 tmp 但不在临时目录的路径会被记录",
+              !RecentProjects.isTemporary(fm.homeDirectoryForCurrentUser
+                                            .appendingPathComponent("tmp-notes/a.md").path),
+              detail: "只按目录判断，不做子串匹配")
+
+        // ---- and the real thing: opening a temp file must not enter the list
+        let saved = UserDefaults.standard.array(forKey: "recentItems")
+        defer {
+            if let saved { UserDefaults.standard.set(saved, forKey: "recentItems") }
+            else { UserDefaults.standard.removeObject(forKey: "recentItems") }
+        }
+        let dir = fm.temporaryDirectory
+            .appendingPathComponent("bonecode-recent-\(UUID().uuidString)")
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("Demo.java")
+        try? "class Demo {}\n".write(to: file, atomically: true, encoding: .utf8)
+
+        let before = RecentProjects.shared.recentItems.count
+        RecentProjects.shared.noteFile(file)
+        RecentProjects.shared.noteFolder(dir)
+        check("打开临时文件后，最近列表条目数不变（根本没进去）",
+              RecentProjects.shared.recentItems.count == before,
+              detail: "前 \(before)，后 \(RecentProjects.shared.recentItems.count)")
+        check("临时路径不在最近列表里",
+              !RecentProjects.shared.recentItems.contains { $0.path.hasPrefix(dir.path) })
     }
 
     // MARK: - PTY
