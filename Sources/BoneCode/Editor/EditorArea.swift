@@ -662,15 +662,31 @@ final class WelcomeView: NSView {
         let grid = NSGridView()
         grid.rowSpacing = 5
         grid.columnSpacing = 14
+        let keyFont = Fonts.code(size: 11)
+        let descFont = Fonts.ui(size: 11.5)
         for (key, desc) in shortcuts {
             let k = NSTextField(labelWithString: key)
-            k.font = Fonts.code(size: 11)
+            k.font = keyFont
             k.alignment = .right
             let d = NSTextField(labelWithString: desc)
-            d.font = Fonts.ui(size: 11.5)
+            d.font = descFont
             shortcutLabels.append(contentsOf: [k, d])
             grid.addRow(with: [k, d])
         }
+
+        // Size both columns explicitly instead of trusting the grid's automatic
+        // sizing. Left to itself the grid collapses to about 80 pt inside this
+        // stack view — roughly two thirds of what it needs — which clipped the
+        // key column mid-glyph: `⌃Space` rendered as `⌃Spa`, with no ellipsis,
+        // while the description beside it looked fine. Fixed widths also stop a
+        // narrow window from silently truncating the list.
+        func widest(_ values: [String], _ font: NSFont) -> CGFloat {
+            values.map { ceil(($0 as NSString).size(withAttributes: [.font: font]).width) }
+                .max() ?? 0
+        }
+        grid.column(at: 0).width = max(44, widest(shortcuts.map { $0.0 }, keyFont))
+        grid.column(at: 0).xPlacement = .trailing
+        grid.column(at: 1).width = widest(shortcuts.map { $0.1 }, descFont)
 
         recentTitle = NSTextField(labelWithString: "最近打开")
         recentTitle.font = Fonts.ui(size: 12, weight: .semibold)

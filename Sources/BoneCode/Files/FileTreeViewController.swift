@@ -322,7 +322,9 @@ final class FileTreeViewController: NSViewController, NSMenuItemValidation {
         headerLabel.stringValue = url.lastPathComponent
         _ = node.loadChildren()
         outlineView.reloadData()
-        outlineView.expandItem(nil, expandChildren: false)
+        // Open the project rather than presenting it collapsed: the root row is
+        // there so the tree *can* be folded away, not so it starts hidden.
+        outlineView.expandItem(node)
         for child in node.children ?? [] where child.isDirectory {
             outlineView.expandItem(child)
             break
@@ -453,10 +455,13 @@ final class FileTreeViewController: NSViewController, NSMenuItemValidation {
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
-        case #selector(renameAction), #selector(trashAction), #selector(duplicateAction),
-             #selector(revealAction), #selector(copyPathAction), #selector(openTerminalAction):
-            let row = outlineView.clickedRow >= 0 ? outlineView.clickedRow : outlineView.selectedRow
-            return row >= 0
+        // The project root is a row now, so these have to exclude it explicitly.
+        // Before, the root could never be selected and "移到废纸篓" could not
+        // reach it; without this guard one mis-click would trash the whole project.
+        case #selector(renameAction), #selector(trashAction), #selector(duplicateAction):
+            return contextNode(excludingRoot: true) != nil
+        case #selector(revealAction), #selector(copyPathAction), #selector(openTerminalAction):
+            return contextNode(excludingRoot: false) != nil
         case #selector(newFileAction), #selector(newFolderAction):
             return rootNode != nil
         default:
@@ -464,9 +469,19 @@ final class FileTreeViewController: NSViewController, NSMenuItemValidation {
         }
     }
 
-    private func targetDirectory() -> URL? {
+    /// The node the context menu applies to.
+    ///
+    /// `excludingRoot` is for operations that move or rename the target — acting on
+    /// the project root would take the whole project with it.
+    private func contextNode(excludingRoot: Bool) -> FileNode? {
         let row = outlineView.clickedRow >= 0 ? outlineView.clickedRow : outlineView.selectedRow
-        guard row >= 0, let node = outlineView.item(atRow: row) as? FileNode else { return rootNode?.url }
+        guard row >= 0, let node = outlineView.item(atRow: row) as? FileNode else { return nil }
+        if excludingRoot, node === rootNode { return nil }
+        return node
+    }
+
+    private func targetDirectory() -> URL? {
+        guard let node = contextNode(excludingRoot: false) else { return rootNode?.url }
         return node.isDirectory ? node.url : node.url.deletingLastPathComponent()
     }
 
@@ -500,8 +515,7 @@ final class FileTreeViewController: NSViewController, NSMenuItemValidation {
     }
 
     @objc private func renameAction() {
-        let row = outlineView.clickedRow >= 0 ? outlineView.clickedRow : outlineView.selectedRow
-        guard row >= 0, let node = outlineView.item(atRow: row) as? FileNode else { return }
+        guard let node = contextNode(excludingRoot: true) else { return }
         guard let name = promptForName(title: "重命名", placeholder: node.name, initial: node.name) else { return }
         let target = node.url.deletingLastPathComponent().appendingPathComponent(name)
         do {
@@ -513,8 +527,7 @@ final class FileTreeViewController: NSViewController, NSMenuItemValidation {
     }
 
     @objc private func duplicateAction() {
-        let row = outlineView.clickedRow >= 0 ? outlineView.clickedRow : outlineView.selectedRow
-        guard row >= 0, let node = outlineView.item(atRow: row) as? FileNode else { return }
+        guard let node = contextNode(excludingRoot: true) else { return }
         let base = node.url.deletingPathExtension().lastPathComponent
         let ext = node.url.pathExtension
         var candidate = node.url.deletingLastPathComponent().appendingPathComponent("\(base) 副本.\(ext)")
@@ -552,8 +565,8 @@ final class FileTreeViewController: NSViewController, NSMenuItemValidation {
     }
 
     @objc private func trashAction() {
-        let row = outlineView.clickedRow >= 0 ? outlineView.clickedRow : outlineView.selectedRow
-        guard row >= 0, let node = outlineView.item(atRow: row) as? FileNode else { return }
+        // Never the project root: that would move the whole project to the Trash.
+        guard let node = contextNode(excludingRoot: true) else { return }
 
         let alert = NSAlert()
         alert.messageText = "确定要移到废纸篓吗？"
@@ -603,7 +616,9 @@ extension FileTreeViewController: NSOutlineViewDataSource, NSOutlineViewDelegate
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
         if isFiltering { return item == nil ? filteredResults.count : 0 }
         guard let node = item as? FileNode else {
-            return rootNode?.children?.count ?? 0
+            // The project itself is the single top-level row, so the whole tree can
+            // be collapsed out of the way.
+            return rootNode == nil ? 0 : 1
         }
         return node.loadChildren().count
     }
@@ -611,7 +626,7 @@ extension FileTreeViewController: NSOutlineViewDataSource, NSOutlineViewDelegate
     func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
         if isFiltering { return filteredResults[index] }
         guard let node = item as? FileNode else {
-            return rootNode?.children?[index] as Any
+            return rootNode as Any
         }
         return node.loadChildren()[index]
     }

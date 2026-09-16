@@ -86,6 +86,11 @@ final class GitChangesView: NSView {
     private let discardButton = NSButton()
     private let stageToggleButton = NSButton()
     private let statusLabel = NSTextField(labelWithString: "")
+    /// True while a commit is in flight, so the action row stays locked and a
+    /// second click cannot queue another `git commit`.
+    private var isCommitting = false
+    private var lastHasStaged = false
+    private var lastHasChanges = false
 
     private var sections: [Section] = []
     private var allChanges: [GitFileChange] = []
@@ -272,7 +277,10 @@ final class GitChangesView: NSView {
         outlineView.reloadData()
         for section in sections { outlineView.expandItem(section.title) }
 
-        if let state {
+        if isCommitting {
+            // A watcher-triggered refresh must not wipe the "正在提交…" message —
+            // that message is the only sign the click registered.
+        } else if let state {
             var parts: [String] = []
             if state.conflictedCount > 0 { parts.append("⚠️ \(state.conflictedCount) 个冲突待解决") }
             if state.isClean { parts.append("工作区干净") }
@@ -283,13 +291,54 @@ final class GitChangesView: NSView {
             statusLabel.stringValue = "未检测到 Git 仓库"
         }
 
-        let hasStaged = !staged.isEmpty
-        commitButton.isEnabled = hasStaged
-        commitPushButton.isEnabled = hasStaged
-        amendButton.isEnabled = true
-        discardButton.isEnabled = !allChanges.isEmpty
-        stageAllButton.isEnabled = !allChanges.isEmpty
-        unstageAllButton.isEnabled = hasStaged
+        lastHasStaged = !staged.isEmpty
+        lastHasChanges = !allChanges.isEmpty
+        updateButtonStates()
+    }
+
+    /// Enables the action row from the last known repository state.
+    ///
+    /// Every entry point funnels through here so the row cannot be left disabled
+    /// after a failure, and so a slow commit can lock it without the next refresh
+    /// silently unlocking it again.
+    private func updateButtonStates() {
+        let idle = !isCommitting
+        commitButton.isEnabled = idle && lastHasStaged
+        commitPushButton.isEnabled = idle && lastHasStaged
+        amendButton.isEnabled = idle
+        aiButton.isEnabled = idle
+        discardButton.isEnabled = idle && lastHasChanges
+        stageAllButton.isEnabled = idle && lastHasChanges
+        unstageAllButton.isEnabled = idle && lastHasStaged
+    }
+
+    /// Shows that a commit is running, and locks the row until it finishes.
+    ///
+    /// A commit is not instant: a project with a `pre-commit` hook (husky +
+    /// lint-staged) runs the whole linter first, which can take many seconds.
+    /// With no immediate feedback the button looks dead, so the click gets
+    /// repeated — and each repeat queues another `git commit`.
+    private func setCommitBusy(_ busy: Bool, label: String = "") {
+        isCommitting = busy
+        if busy {
+            statusLabel.textColor = ThemeManager.shared.current.text
+            statusLabel.stringValue = label
+        } else {
+            statusLabel.textColor = ThemeManager.shared.current.tertiaryText
+            // Clear it here rather than waiting for the refresh that follows: until
+            // that lands, the row would still claim a commit is running.
+            statusLabel.stringValue = ""
+        }
+        updateButtonStates()
+    }
+
+    /// The contents of the commit message box.
+    ///
+    /// Exposed so the AI flow and tests can set it without reaching into the text
+    /// view, which also carries the placeholder and focus behaviour.
+    var commitMessage: String {
+        get { messageView.string }
+        set { messageView.string = newValue }
     }
 
     func clearMessage() { messageView.string = "" }
@@ -313,37 +362,87 @@ final class GitChangesView: NSView {
         onShowDiff?(box.change, staged)
     }
 
+    /// Toggle staging for the selected rows.
+    ///
+    /// Every branch here used to discard the `ProcessResult`, so a successful
+    /// staging reported nothing and a *failed* one was swallowed entirely — the
+    /// button looked dead while `git add` had actually run.
     @objc private func toggleStage() {
         let changes = selectedChanges()
-        guard !changes.isEmpty else { return }
-        let toStage = changes.filter { $0.hasUnstaged }
-        let toUnstage = changes.filter { $0.hasStaged && !$0.hasUnstaged }
-        let group = DispatchGroup()
-        if !toStage.isEmpty {
-            group.enter()
-            GitService.shared.stage(toStage.map { $0.path }) { _ in group.leave() }
-        }
-        if !toUnstage.isEmpty {
-            group.enter()
-            GitService.shared.unstage(toUnstage.map { $0.path }) { _ in group.leave() }
-        }
-        if toStage.isEmpty && toUnstage.isEmpty, let first = changes.first {
-            if first.hasStaged {
-                GitService.shared.unstage(changes.map { $0.path }) { _ in self.onNeedsRefresh?() }
-            } else {
-                GitService.shared.stage(changes.map { $0.path }) { _ in self.onNeedsRefresh?() }
-            }
+        guard !changes.isEmpty else {
+            onInfo?("请先选中要暂存或取消暂存的文件")
             return
         }
-        group.notify(queue: .main) { [weak self] in self?.onNeedsRefresh?() }
+
+        var stagePaths = changes.filter { $0.hasUnstaged }.map { $0.path }
+        var unstagePaths = changes.filter { $0.hasStaged && !$0.hasUnstaged }.map { $0.path }
+
+        // A file with both staged and unstaged edits is ambiguous; follow what the
+        // row's state suggests rather than silently doing nothing.
+        if stagePaths.isEmpty && unstagePaths.isEmpty {
+            if changes[0].hasStaged {
+                unstagePaths = changes.map { $0.path }
+            } else {
+                stagePaths = changes.map { $0.path }
+            }
+        }
+
+        // GitService always calls back on the main queue, so this needs no lock.
+        var failures: [String] = []
+        let group = DispatchGroup()
+
+        if !stagePaths.isEmpty {
+            group.enter()
+            GitService.shared.stage(stagePaths) { result in
+                if !result.ok { failures.append(result.failureText("暂存") ) }
+                group.leave()
+            }
+        }
+        if !unstagePaths.isEmpty {
+            group.enter()
+            GitService.shared.unstage(unstagePaths) { result in
+                if !result.ok { failures.append(result.failureText("取消暂存")) }
+                group.leave()
+            }
+        }
+
+        group.notify(queue: .main) { [weak self] in
+            guard let self else { return }
+            // Refresh even on failure: a partial failure still moved the index.
+            self.onNeedsRefresh?()
+            if let first = failures.first {
+                self.onError?(first)
+                return
+            }
+            var parts: [String] = []
+            if !stagePaths.isEmpty { parts.append("已暂存 \(stagePaths.count) 个文件") }
+            if !unstagePaths.isEmpty { parts.append("已取消暂存 \(unstagePaths.count) 个文件") }
+            if !parts.isEmpty { self.onInfo?(parts.joined(separator: "，")) }
+        }
     }
 
     @objc private func stageAll() {
-        GitService.shared.stageAll { [weak self] _ in self?.onNeedsRefresh?() }
+        GitService.shared.stageAll { [weak self] result in
+            guard let self else { return }
+            self.onNeedsRefresh?()
+            if result.ok {
+                self.onInfo?("已暂存全部改动")
+            } else {
+                self.onError?(result.failureText("全部暂存"))
+            }
+        }
     }
 
     @objc private func unstageAll() {
-        GitService.shared.unstageAll { [weak self] _ in self?.onNeedsRefresh?() }
+        GitService.shared.unstageAll { [weak self] result in
+            guard let self else { return }
+            self.onNeedsRefresh?()
+            if result.ok {
+                self.onInfo?("已取消全部暂存")
+            } else {
+                self.onError?(result.failureText("取消全部暂存"))
+            }
+        }
     }
 
     @objc private func discardSelected() {
@@ -360,15 +459,102 @@ final class GitChangesView: NSView {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         let group = DispatchGroup()
+        // Reporting "已丢弃 N 个文件" unconditionally was worse than saying
+        // nothing: a failed discard still claimed success and the files were
+        // still there.
+        var failures: [String] = []
         for change in changes {
             group.enter()
             let untracked = !change.hasStaged && change.unstaged == .untracked
-            GitService.shared.discard([change.path], untracked: untracked) { _ in group.leave() }
+            GitService.shared.discard([change.path], untracked: untracked) { result in
+                if !result.ok {
+                    failures.append("\(change.path)：\(result.failureText("丢弃"))")
+                }
+                group.leave()
+            }
         }
         group.notify(queue: .main) { [weak self] in
-            self?.onInfo?("已丢弃 \(changes.count) 个文件的改动")
-            self?.onNeedsRefresh?()
+            guard let self else { return }
+            self.onNeedsRefresh?()
+            let succeeded = changes.count - failures.count
+            if !failures.isEmpty {
+                // Say what did happen as well as what did not, so the count in the
+                // tree matches what the user was told.
+                let head = succeeded > 0 ? "已丢弃 \(succeeded) 个，\(failures.count) 个失败：\n" : ""
+                self.onError?(head + failures.joined(separator: "\n"))
+                return
+            }
+            self.onInfo?("已丢弃 \(changes.count) 个文件的改动")
         }
+    }
+
+    /// Explains a commit rejection that came from a hook rather than from Git.
+    ///
+    /// The most common reason a commit fails is not Git at all: a `pre-commit`
+    /// hook (husky, lint-staged, …) runs the project's own linter, and the user
+    /// sees nothing but raw linter output. Without this header it reads like Git
+    /// is complaining about something the user did wrong.
+    ///
+    /// Deciding this needs care, because a linter's output mentions no hook at
+    /// all — a failed run is just file paths, rule names and an error count. Two
+    /// signals, in order of confidence:
+    ///
+    /// 1. The output names a hook. Conclusive.
+    /// 2. A hook exists **and** the output contains none of Git's own refusal
+    ///    messages. Git adds nothing of its own when a hook fails, so "no git
+    ///    message" plus "hook present" is the reliable combination — and it is
+    ///    what stops a plain "nothing to commit" from being blamed on the hook.
+    static func hookRejectionHint(output: String, repoRoot: String?) -> String? {
+        let lowered = output.lowercased()
+
+        let named = ["husky", "lint-staged", "pre-commit", "precommit",
+                     "commit-msg", "commitlint", "hook"]
+            .contains { lowered.contains($0) }
+        if named { return hookExplanation }
+
+        guard let repoRoot, hasCommitHook(at: repoRoot) else { return nil }
+        let gitOwnRefusal = ["nothing to commit", "no changes added to commit",
+                             "nothing added to commit", "please tell me who you are",
+                             "aborting commit", "unmerged", "not a git repository",
+                             "pathspec", "did not match any file"]
+            .contains { lowered.contains($0) }
+        return gitOwnRefusal ? nil : hookExplanation
+    }
+
+    private static let hookExplanation = """
+    提交被项目的 Git 钩子拦下了。
+
+    下面的输出来自项目自己的检查脚本（通常是 ESLint / lint-staged 之类的 \
+    代码检查），不是 Git 报的错。要提交成功，需要先修掉这些检查问题；\
+    确实想跳过检查时，可以在集成终端里用 git commit --no-verify。
+    """
+
+    /// Whether a commit-time hook would actually run in this repository.
+    ///
+    /// Checks `pre-commit` and `commit-msg` (the two that reject commits), in the
+    /// usual locations including husky's `core.hooksPath` default of `.husky/_`.
+    /// Only executable files count — Git ignores the rest.
+    static func hasCommitHook(at root: String) -> Bool {
+        guard !root.isEmpty else { return false }
+        let fm = FileManager.default
+
+        // In a worktree or submodule `.git` is a file pointing at the real dir.
+        var gitDir = root + "/.git"
+        if let contents = try? String(contentsOfFile: gitDir, encoding: .utf8),
+           contents.hasPrefix("gitdir:") {
+            let path = contents.dropFirst("gitdir:".count)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            gitDir = path.hasPrefix("/") ? path : root + "/" + path
+        }
+
+        var candidates: [String] = []
+        for name in ["pre-commit", "commit-msg"] {
+            candidates.append(gitDir + "/hooks/" + name)
+            // husky v9 sets core.hooksPath=.husky/_
+            candidates.append(root + "/.husky/_/" + name)
+            candidates.append(root + "/.husky/" + name)
+        }
+        return candidates.contains { fm.isExecutableFile(atPath: $0) }
     }
 
     private func performCommit(message: String, amend: Bool, push: Bool) {
@@ -377,22 +563,55 @@ final class GitChangesView: NSView {
             onError?("请先填写提交信息")
             return
         }
+        guard !isCommitting else { return }
+
+        // Say something *before* running git. `git commit` returns only when the
+        // pre-commit hook has finished, and a lint-staged hook can take many
+        // seconds — with no immediate feedback the row looks dead, so the click
+        // gets repeated.
+        setCommitBusy(true, label: amend ? "正在修正上一次提交…"
+                                         : (push ? "正在提交并推送…" : "正在提交…"))
+
         GitService.shared.commit(message: trimmed, amend: amend) { [weak self] result in
             guard let self else { return }
             guard result.ok else {
-                self.onError?(result.combined.trimmed)
+                // A rejected commit can still have changed the working tree: a
+                // hook such as `lint-staged` with `eslint --fix` rewrites files
+                // before it fails. Refresh so the list matches the disk, and
+                // unlock the row so the user can fix things and retry.
+                self.setCommitBusy(false)
+                self.onNeedsRefresh?()
+                let detail = result.combined.trimmed
+                let body = detail.isEmpty ? "提交失败（退出码 \(result.exitCode)）" : detail
+                if let hint = GitChangesView.hookRejectionHint(
+                    output: detail, repoRoot: GitService.shared.root) {
+                    self.onError?(hint + "\n\n" + body)
+                } else {
+                    self.onError?(body)
+                }
                 return
             }
             self.clearMessage()
             self.onInfo?(amend ? "已修正上一次提交" : "提交成功")
             self.onNeedsRefresh?()
             if push {
+                // Keep the row locked across the push: "提交并推送" is one action
+                // from the user's point of view.
+                self.statusLabel.stringValue = "正在推送…"
                 NotificationCenter.default.post(name: .gitStatusDidChange, object: nil)
                 GitService.shared.push { text in
                     self.onInfo?(text.trimmed)
-                } onExit: { _ in
+                } onExit: { code in
+                    self.setCommitBusy(false)
                     self.onNeedsRefresh?()
+                    if code != 0 {
+                        self.onError?("提交成功，但推送失败（退出码 \(code)）。\n上面是 git 的输出。")
+                    } else {
+                        self.onInfo?("已推送")
+                    }
                 }
+            } else {
+                self.setCommitBusy(false)
             }
         }
     }
@@ -420,16 +639,19 @@ final class GitChangesView: NSView {
             onError?("尚未配置 AI：请在「设置 → AI 助手」中填入接口地址与密钥")
             return
         }
-        statusLabel.stringValue = "正在生成提交信息…"
+        guard !isCommitting else { return }
+        setCommitBusy(true, label: "正在生成提交信息…")
         GitService.shared.stagedDiffForAI { [weak self] diff in
             guard let self else { return }
             let payload = diff.isEmpty ? "（暂存区为空）" : String(diff.prefix(12000))
             GitService.shared.run(["log", "-5", "--pretty=%s"]) { logResult in
                 AIService.shared.generateCommitMessage(diff: payload,
                                                        recentStyle: logResult.stdout) { result in
+                    self.setCommitBusy(false)
                     switch result {
                     case .success(let message):
-                        self.messageView.string = message.trimmingCharacters(in: .whitespacesAndNewlines)
+                        self.commitMessage = message
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
                         self.statusLabel.stringValue = "已生成提交信息"
                     case .failure(let error):
                         self.onError?("生成失败：\(error.localizedDescription)")
@@ -1097,8 +1319,15 @@ final class GitBranchesView: NSView, NSMenuItemValidation {
                                remote: "origin", branch: name,
                                onOutput: { [weak self] text in self?.onInfo?(text.trimmed) },
                                onExit: { [weak self] code in
-            if code == 0 { self?.onInfo?("已推送 \(name)") }
-            self?.onNeedsRefresh?()
+            guard let self else { return }
+            self.onNeedsRefresh?()
+            // Only the success case used to be reported, so a failed push (auth,
+            // rejected non-fast-forward, no network) said nothing at all.
+            if code == 0 {
+                self.onInfo?("已推送 \(name)")
+            } else {
+                self.onError?("推送 \(name) 失败（退出码 \(code)）。\n上面是 git 的输出。")
+            }
         })
     }
 

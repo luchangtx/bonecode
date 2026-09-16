@@ -438,11 +438,79 @@ final class MainViewController: NSViewController {
 
 final class MainWindowController: NSWindowController, NSToolbarDelegate {
 
+    static let frameAutosaveName = "BoneCodeMainWindow"
+
     let mainViewController = MainViewController()
+
+    /// The frame the window opens at when there is no saved one.
+    ///
+    /// A hard-coded size cannot suit every display: 1380×880 is most of a
+    /// 1512-wide laptop screen but barely half of a large external monitor. Derive
+    /// it from the display, leaving a margin so the window still reads as a window
+    /// rather than as full screen.
+    ///
+    /// Works on the **frame**, not the content size: the unified title bar and
+    /// toolbar add roughly 50-85 pt of chrome, so sizing the content would leave
+    /// the window nearly touching the screen edge.
+    static func defaultFrame(in visible: NSRect) -> NSRect {
+        guard visible.width > 0, visible.height > 0 else {
+            return NSRect(x: 0, y: 0, width: 1380, height: 880)
+        }
+        // Fill the display minus a margin, but never below a usable minimum and
+        // never larger than the display itself — a screen narrower than the
+        // minimum gets a full-width window rather than one hanging off the edge.
+        let width = min(max(visible.width - 96, 900), visible.width, 2400)
+        let height = min(max(visible.height - 72, 600), visible.height, 1600)
+        return NSRect(x: visible.minX + ((visible.width - width) / 2).rounded(),
+                      y: visible.minY + ((visible.height - height) / 2).rounded(),
+                      width: width.rounded(),
+                      height: height.rounded())
+    }
+
+    static func defaultFrame(for screen: NSScreen? = nil) -> NSRect {
+        defaultFrame(in: (screen ?? NSScreen.main)?.visibleFrame
+                        ?? NSRect(x: 0, y: 0, width: 1440, height: 900))
+    }
+
+    /// Set once the user has resized the window themselves.
+    ///
+    /// Until then the window keeps adapting to the display. This is deliberately
+    /// *not* a one-shot migration flag: such a flag gets consumed by any launch,
+    /// including test runs, and cannot tell a size the user chose from one left
+    /// behind by a bug. Dragging the window is unambiguous evidence of intent.
+    static let userSizedMarker = "hasUserSizedWindow"
+
+    static var userHasSizedWindow: Bool {
+        get { UserDefaults.standard.bool(forKey: userSizedMarker) }
+        set { UserDefaults.standard.set(newValue, forKey: userSizedMarker) }
+    }
+
+    /// Restores the user's frame once they have chosen one, and otherwise sizes
+    /// the window to the display.
+    ///
+    /// **Must run after `contentViewController` is assigned.** Setting that
+    /// property resizes the window to the view controller's view fitting size
+    /// (clamped by `minSize`), so any frame applied earlier is thrown away — which
+    /// is exactly why the window used to open at 820×572, its minimum width,
+    /// instead of the size asked for.
+    static func applyLaunchFrame(to window: NSWindow) {
+        window.setFrameAutosaveName(frameAutosaveName)
+
+        let screen = window.screen ?? NSScreen.main
+        let onScreen = screen.map { $0.visibleFrame.intersects(window.frame) } ?? false
+        let usable = window.frame.width >= 200 && window.frame.height >= 200
+
+        // A frame the user chose wins — but only while it is still reachable. One
+        // left over from a disconnected display is discarded rather than restored
+        // off-screen, where it cannot be dragged back.
+        if userHasSizedWindow, onScreen, usable { return }
+
+        window.setFrame(defaultFrame(for: screen), display: false)
+    }
 
     convenience init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 1380, height: 880),
+            contentRect: MainWindowController.defaultFrame(),
             // No .fullSizeContentView: the content view would extend under the
             // title bar and the toolbar's leading items would end up beneath the
             // close/minimise/zoom buttons.
@@ -457,8 +525,6 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
         // view is forced to violate them and the dividers stop responding.
         window.minSize = NSSize(width: 820, height: 520)
         window.tabbingMode = .disallowed
-        window.setFrameAutosaveName("BoneCodeMainWindow")
-        window.center()
 
         self.init(window: window)
         window.contentViewController = mainViewController
@@ -470,6 +536,12 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
         toolbar.allowsUserCustomization = true
         toolbar.autosavesConfiguration = true
         window.toolbar = toolbar
+
+        // Last, once the window has its final chrome. Both `contentViewController`
+        // and the toolbar resize the window, and the toolbar grows the unified
+        // title bar by ~50 pt — so a frame applied earlier would be too tall for
+        // the screen once that happened.
+        MainWindowController.applyLaunchFrame(to: window)
 
         AppState.shared.mainWindow = window
         NotificationCenter.default.addObserver(self, selector: #selector(themeChanged),
@@ -606,6 +678,19 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate {
 }
 
 extension MainWindowController: NSWindowDelegate {
+    /// Records that the user has chosen a size, so the next launch restores it
+    /// instead of re-fitting the window to the display.
+    ///
+    /// `windowDidEndLiveResize` only fires after a drag, so programmatic resizes
+    /// during setup cannot be mistaken for user intent.
+    func windowDidEndLiveResize(_ notification: Notification) {
+        MainWindowController.userHasSizedWindow = true
+    }
+
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        MainWindowController.userHasSizedWindow = true
+    }
+
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard mainViewController.editorArea.promptSaveAllIfNeeded() else { return false }
         mainViewController.terminalPanel.terminateAll()

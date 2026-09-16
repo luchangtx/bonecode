@@ -440,14 +440,32 @@ final class GitPanelViewController: NSViewController {
     @objc private func doContinueOperation() {
         guard let op = state?.operation else { return }
         GitService.shared.continueOperation(op) { [weak self] result in
-            if !result.ok { self?.showErrorAlert(result.combined.trimmed) }
-            self?.refreshNow()
+            guard let self else { return }
+            self.refreshNow()
+            if result.ok {
+                AppState.shared.postStatus("已继续\(op)")
+            } else {
+                // The output normally says what still needs resolving.
+                self.showErrorAlert(result.combined.trimmed.isEmpty
+                                    ? "继续\(op)失败" : result.combined.trimmed)
+            }
         }
     }
 
     @objc private func doSkipOperation() {
         guard let op = state?.operation else { return }
-        GitService.shared.skipOperation(op) { [weak self] _ in self?.refreshNow() }
+        // The result used to be discarded entirely: a failed skip said nothing
+        // and left the user stuck mid-operation with no explanation.
+        GitService.shared.skipOperation(op) { [weak self] result in
+            guard let self else { return }
+            self.refreshNow()
+            if result.ok {
+                AppState.shared.postStatus("已跳过当前提交")
+            } else {
+                self.showErrorAlert(result.combined.trimmed.isEmpty
+                                    ? "跳过失败" : result.combined.trimmed)
+            }
+        }
     }
 
     @objc private func doAbortOperation() {
@@ -459,7 +477,16 @@ final class GitPanelViewController: NSViewController {
         alert.addButton(withTitle: "中止")
         alert.addButton(withTitle: "取消")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        GitService.shared.abortOperation(op) { [weak self] _ in self?.refreshNow() }
+        GitService.shared.abortOperation(op) { [weak self] result in
+            guard let self else { return }
+            self.refreshNow()
+            if result.ok {
+                AppState.shared.postStatus("已中止\(op)，工作区已回到操作前")
+            } else {
+                self.showErrorAlert(result.combined.trimmed.isEmpty
+                                    ? "中止\(op)失败" : result.combined.trimmed)
+            }
+        }
     }
 
     // MARK: - Remote operations

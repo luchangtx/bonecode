@@ -51,6 +51,11 @@ enum SelfTest {
         testDividerDragging()
         testGitLayer()
         testGitChangesGrouping()
+        testGitActionFeedback()
+        testWindowSizing()
+        testWelcomeShortcutLayout()
+        testFileTreeRootNode()
+        testCommitBusyState()
         testPTYEndToEnd()
 
         return finish()
@@ -1343,6 +1348,654 @@ enum SelfTest {
         }
     }
 
+    // MARK: - Git action feedback
+
+    /// Regression: the staging buttons gave no feedback at all.
+    ///
+    /// Every branch of `toggleStage` / `stageAll` / `unstageAll` discarded the
+    /// `ProcessResult` — a successful action reported nothing and a *failed* one
+    /// was swallowed, so the button looked dead even though `git add` had really
+    /// run. `discardSelected` went further and announced success unconditionally.
+    private static func testGitActionFeedback() {
+        section("Git 按钮反馈（回归：点了没反应）")
+
+        // ---- a failed command must always produce something readable
+        let silent = ProcessResult(exitCode: 1, stdout: "", stderr: "")
+        check("命令无输出时也给出可读的失败说明",
+              silent.failureText("暂存").contains("暂存")
+                  && silent.failureText("暂存").contains("1"),
+              detail: silent.failureText("暂存"))
+        let stdoutOnly = ProcessResult(exitCode: 1,
+                                       stdout: "error: pathspec 'x' did not match\n",
+                                       stderr: "")
+        check("有输出时直接使用输出内容",
+              stdoutOnly.failureText("暂存") == "error: pathspec 'x' did not match",
+              detail: stdoutOnly.failureText("暂存"))
+        let stderrOnly = ProcessResult(exitCode: 128, stdout: "",
+                                       stderr: "fatal: not a git repository\n")
+        check("stderr 内容也会被带上",
+              stderrOnly.failureText("提交").contains("not a git repository"),
+              detail: stderrOnly.failureText("提交"))
+        check("成功的命令不算失败",
+              ProcessResult(exitCode: 0, stdout: "ok", stderr: "").ok)
+
+        // ---- hook detection, used to explain a rejected commit
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("bonecode-hook-\(UUID().uuidString)")
+        try? fm.createDirectory(at: dir.appendingPathComponent(".git/hooks"),
+                                withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: dir) }
+
+        check("没有钩子时不误报", !GitChangesView.hasCommitHook(at: dir.path))
+        check("空路径不误报", !GitChangesView.hasCommitHook(at: ""))
+
+        let hook = dir.appendingPathComponent(".git/hooks/pre-commit")
+        try? "#!/bin/sh\nexit 1\n".write(to: hook, atomically: true, encoding: .utf8)
+        // Git only runs executable hooks, so a plain file must not count.
+        try? fm.setAttributes([.posixPermissions: 0o644], ofItemAtPath: hook.path)
+        check("不可执行的钩子文件不算数（Git 不会运行它）",
+              !GitChangesView.hasCommitHook(at: dir.path))
+
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
+        check("存在可执行的 pre-commit 钩子时能检测到",
+              GitChangesView.hasCommitHook(at: dir.path))
+
+        // husky v9 points core.hooksPath at .husky/_
+        let huskyHook = dir.appendingPathComponent(".husky/_/commit-msg")
+        try? fm.createDirectory(at: huskyHook.deletingLastPathComponent(),
+                                withIntermediateDirectories: true)
+        try? "#!/bin/sh\nexit 1\n".write(to: huskyHook, atomically: true, encoding: .utf8)
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: huskyHook.path)
+        check("husky 的 .husky/_/commit-msg 也能检测到（提交信息校验）",
+              GitChangesView.hasCommitHook(at: dir.path))
+
+        // ---- the explanation itself.
+        //
+        // The hard case is the real one: a linter's output names no hook at all.
+        // It is just file paths, rule names and an error count — so detection has
+        // to lean on the hook file being present.
+        let lintOutput = """
+        /src/App.vue
+          12:3  error  Custom event name 'add-branch' must be camelCase  vue/custom-event-name-casing
+
+        ✖ 1 problem (1 error, 0 warnings)
+        """
+        let hint = GitChangesView.hookRejectionHint(output: lintOutput, repoRoot: dir.path)
+        check("纯 lint 输出 + 仓库有钩子 → 给出钩子说明", hint != nil,
+              detail: hint == nil ? "返回 nil" : "有说明")
+        check("说明里明确区分「不是 Git 报的错」",
+              hint?.contains("不是 Git 报的错") == true, detail: hint ?? "nil")
+        check("说明里告诉用户可以 --no-verify 跳过",
+              hint?.contains("--no-verify") == true)
+        check("说明里点明输出来自项目自己的检查脚本",
+              hint?.contains("检查脚本") == true)
+
+        check("输出直接提到 husky 时，即使没有钩子文件也给出说明",
+              GitChangesView.hookRejectionHint(output: "husky - pre-commit script failed",
+                                               repoRoot: nil) != nil)
+        check("输出提到 commitlint 时也能识别",
+              GitChangesView.hookRejectionHint(output: "✖ subject may not be empty [subject-empty]",
+                                               repoRoot: nil) == nil,
+              detail: "纯 commitlint 规则文本无线索，属预期")
+
+        // ---- and the negative controls: never blame the hook for Git's own refusals
+        check("Git 自己的「无可提交」不甩锅给钩子",
+              GitChangesView.hookRejectionHint(output: "nothing to commit, working tree clean",
+                                               repoRoot: dir.path) == nil)
+        check("「没有作者信息」不甩锅给钩子",
+              GitChangesView.hookRejectionHint(
+                output: "*** Please tell me who you are.", repoRoot: dir.path) == nil)
+        check("「路径不匹配」不甩锅给钩子",
+              GitChangesView.hookRejectionHint(
+                output: "error: pathspec 'x' did not match any file(s) known to git",
+                repoRoot: dir.path) == nil)
+        check("既无钩子也无输出线索时不加说明（避免误导）",
+              GitChangesView.hookRejectionHint(output: "fatal: not a git repository",
+                                               repoRoot: nil) == nil)
+
+        // ---- end to end: the buttons must report what they did
+        let repo = fm.temporaryDirectory
+            .appendingPathComponent("bonecode-gitfb-\(UUID().uuidString)")
+        try? fm.createDirectory(at: repo, withIntermediateDirectories: true)
+        defer {
+            GitService.shared.close()
+            try? fm.removeItem(at: repo)
+        }
+        let git = ProcessRunner.gitPath()
+        func gitRun(_ args: [String]) -> ProcessResult {
+            ProcessRunner.run(git, args, cwd: repo.path)
+        }
+        _ = gitRun(["init", "-q", "-b", "main"])
+        _ = gitRun(["config", "user.email", "test@bonecode.local"])
+        _ = gitRun(["config", "user.name", "BoneCode Test"])
+        _ = gitRun(["config", "commit.gpgsign", "false"])
+        try? "one\n".write(to: repo.appendingPathComponent("a.txt"),
+                           atomically: true, encoding: .utf8)
+        _ = gitRun(["add", "-A"])
+        _ = gitRun(["commit", "-q", "-m", "chore: seed"])
+        try? "one\ntwo\n".write(to: repo.appendingPathComponent("a.txt"),
+                                atomically: true, encoding: .utf8)
+
+        check("测试仓库已打开", GitService.shared.openRepository(at: repo.path))
+
+        let view = GitChangesView(frame: NSRect(x: 0, y: 0, width: 400, height: 600))
+        var infos: [String] = []
+        var errors: [String] = []
+        var refreshes = 0
+        view.onInfo = { infos.append($0) }
+        view.onError = { errors.append($0) }
+        view.onNeedsRefresh = { refreshes += 1 }
+
+        // Nothing selected: must say so rather than silently doing nothing.
+        _ = view.perform(NSSelectorFromString("toggleStage"))
+        pumpRunLoop(seconds: 0.4)
+        check("未选中文件时给出提示（以前完全静默）",
+              infos.contains { $0.contains("选中") },
+              detail: "info=\(infos) error=\(errors)")
+
+        infos.removeAll(); errors.removeAll(); refreshes = 0
+        _ = view.perform(NSSelectorFromString("stageAll"))
+        pumpRunLoop(seconds: 5) { !infos.isEmpty || !errors.isEmpty }
+        check("「全部暂存」成功后给出反馈",
+              infos.contains { $0.contains("暂存") },
+              detail: "info=\(infos) error=\(errors)")
+        check("「全部暂存」触发刷新", refreshes > 0, detail: "\(refreshes) 次")
+        check("「全部暂存」没有报错", errors.isEmpty, detail: "\(errors)")
+
+        // The index really changed, so the feedback was not a lie.
+        let staged = gitRun(["diff", "--cached", "--name-only"])
+        check("反馈与真实结果一致（暂存区确实有 a.txt）",
+              staged.stdout.contains("a.txt"), detail: staged.combined.trimmed)
+
+        infos.removeAll(); errors.removeAll(); refreshes = 0
+        _ = view.perform(NSSelectorFromString("unstageAll"))
+        pumpRunLoop(seconds: 5) { !infos.isEmpty || !errors.isEmpty }
+        check("「取消全部暂存」成功后给出反馈",
+              infos.contains { $0.contains("取消") },
+              detail: "info=\(infos) error=\(errors)")
+        let afterUnstage = gitRun(["diff", "--cached", "--name-only"])
+        check("取消暂存后暂存区确实空了",
+              afterUnstage.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              detail: afterUnstage.combined.trimmed)
+
+        // ---- commit + push: a failed push must be reported, not swallowed.
+        //      The exit code used to be discarded, so the user saw "提交成功"
+        //      and then silence even though nothing reached the remote.
+        //      A repo with no upstream makes `git push` fail without needing a
+        //      network or a bogus remote.
+        try? "one\ntwo\nthree\n".write(to: repo.appendingPathComponent("a.txt"),
+                                       atomically: true, encoding: .utf8)
+        _ = gitRun(["add", "-A"])
+        infos.removeAll(); errors.removeAll()
+        view.commitMessage = "chore: 推送失败反馈测试"
+        _ = view.perform(NSSelectorFromString("doCommitAndPush"))
+        pumpRunLoop(seconds: 6) { !errors.isEmpty }
+        check("提交成功本身仍被报告",
+              infos.contains { $0.contains("提交成功") },
+              detail: "info=\(infos)")
+        check("推送失败会被报告出来（以前完全静默）",
+              errors.contains { $0.contains("推送失败") },
+              detail: "error=\(errors)")
+        check("失败提示里带上退出码",
+              errors.contains { $0.contains("退出码") },
+              detail: "error=\(errors)")
+        check("提交信息框在提交成功后被清空",
+              view.commitMessage.isEmpty, detail: "'\(view.commitMessage)'")
+
+        // The commit really landed, so "提交成功" was not a lie either.
+        let head = gitRun(["log", "-1", "--format=%s"])
+        check("提交确实进入了历史",
+              head.stdout.contains("推送失败反馈测试"), detail: head.combined.trimmed)
+    }
+
+    // MARK: - Launch window sizing
+
+    /// The window used to open at a hard-coded 1380×880, and — because
+    /// `contentViewController` and the toolbar both resize the window after the
+    /// frame is set — it actually appeared at 820×572, its minimum width. On a
+    /// 1512-wide laptop that left the editor roughly 230 pt wide.
+    ///
+    /// The sizing is a pure function of the visible frame, so it is asserted here
+    /// without building a window.
+    private static func testWindowSizing() {
+        section("启动窗口尺寸自适应")
+
+        let laptop = NSRect(x: 0, y: 0, width: 1512, height: 949)
+        let onLaptop = MainWindowController.defaultFrame(in: laptop)
+
+        check("小屏：窗口小于可见区（留出边距）",
+              onLaptop.width < laptop.width && onLaptop.height < laptop.height,
+              detail: "\(Int(onLaptop.width))×\(Int(onLaptop.height))")
+        check("小屏：尽量占满可用空间（≥85%）",
+              onLaptop.width / laptop.width >= 0.85
+                  && onLaptop.height / laptop.height >= 0.85,
+              detail: String(format: "%.0f%% × %.0f%%",
+                             onLaptop.width / laptop.width * 100,
+                             onLaptop.height / laptop.height * 100))
+        check("小屏：完全落在可见区内", laptop.contains(onLaptop),
+              detail: "\(onLaptop) ⊄ \(laptop)")
+        check("小屏：水平居中",
+              abs(onLaptop.midX - laptop.midX) <= 1,
+              detail: "窗口中点 \(onLaptop.midX) vs 屏幕中点 \(laptop.midX)")
+        check("小屏：垂直居中",
+              abs(onLaptop.midY - laptop.midY) <= 1,
+              detail: "窗口中点 \(onLaptop.midY) vs 屏幕中点 \(laptop.midY)")
+
+        // ---- a bigger display must actually give a bigger window. This is the
+        //      whole point: a fixed size suits one screen and looks cramped on
+        //      another.
+        let external = NSRect(x: 0, y: 0, width: 2560, height: 1400)
+        let onExternal = MainWindowController.defaultFrame(in: external)
+        check("大屏：窗口比小屏更大",
+              onExternal.width > onLaptop.width && onExternal.height > onLaptop.height,
+              detail: "\(Int(onExternal.width))×\(Int(onExternal.height))"
+                  + " vs \(Int(onLaptop.width))×\(Int(onLaptop.height))")
+        check("大屏：有上限，不会无限放大",
+              onExternal.width <= 2400 && onExternal.height <= 1600,
+              detail: "\(Int(onExternal.width))×\(Int(onExternal.height))")
+        check("大屏：仍在可见区内", external.contains(onExternal))
+
+        // ---- a display narrower than the preferred minimum must still get a
+        //      window that fits, not one hanging off the edge.
+        let small = NSRect(x: 0, y: 0, width: 1024, height: 640)
+        let onSmall = MainWindowController.defaultFrame(in: small)
+        check("小屏：不低于窗口最小尺寸（否则分栏会挤坏）",
+              onSmall.width >= 820 && onSmall.height >= 520,
+              detail: "\(Int(onSmall.width))×\(Int(onSmall.height))")
+        check("小屏：仍在可见区内", small.contains(onSmall),
+              detail: "\(onSmall) ⊄ \(small)")
+
+        let tiny = NSRect(x: 0, y: 0, width: 800, height: 500)
+        let onTiny = MainWindowController.defaultFrame(in: tiny)
+        check("极窄屏：窗口不超出屏幕（宁可贴满也不能溢出）",
+              tiny.contains(onTiny), detail: "\(onTiny) ⊄ \(tiny)")
+
+        // ---- a secondary display with a non-zero origin must not send the window
+        //      to the primary display's coordinates.
+        let secondary = NSRect(x: 1512, y: 200, width: 1920, height: 1080)
+        let onSecondary = MainWindowController.defaultFrame(in: secondary)
+        check("副屏：窗口落在副屏范围内", secondary.contains(onSecondary),
+              detail: "\(onSecondary) ⊄ \(secondary)")
+
+        // ---- degenerate input must not produce a nonsense frame
+        let degenerate = MainWindowController.defaultFrame(in: .zero)
+        check("空可见区有兜底值（不会得到 0 尺寸窗口）",
+              degenerate.width > 0 && degenerate.height > 0,
+              detail: "\(degenerate)")
+    }
+
+    // MARK: - Welcome page shortcuts
+
+    /// The first descendant of the given type, for asserting on views that are
+    /// built deep inside the window hierarchy.
+    private static func firstView<T: NSView>(ofType type: T.Type, in root: NSView) -> T? {
+        if let match = root as? T { return match }
+        for sub in root.subviews {
+            if let found = firstView(ofType: type, in: sub) { return found }
+        }
+        return nil
+    }
+
+    private static func allTextFields(in root: NSView) -> [NSTextField] {
+        var out: [NSTextField] = []
+        if let field = root as? NSTextField { out.append(field) }
+        for sub in root.subviews { out.append(contentsOf: allTextFields(in: sub)) }
+        return out
+    }
+
+    private static func allButtons(in root: NSView) -> [NSButton] {
+        var out: [NSButton] = []
+        if let button = root as? NSButton { out.append(button) }
+        for sub in root.subviews { out.append(contentsOf: allButtons(in: sub)) }
+        return out
+    }
+
+    /// Prints the welcome page's layout boxes, to see what squeezed the shortcut
+    /// column when the surrounding space was plainly sufficient.
+    private static func dumpWelcomeHierarchy(_ root: NSView, depth: Int = 0) {
+        let indent = String(repeating: "  ", count: depth)
+        let name = String(describing: type(of: root))
+        var extra = ""
+        if let grid = root as? NSGridView {
+            let widths = (0..<grid.numberOfColumns)
+                .map { Int(grid.column(at: $0).width) }
+                .map(String.init)
+                .joined(separator: ",")
+            extra = " 列宽=[\(widths)] 行数=\(grid.numberOfRows)"
+        }
+        if let stack = root as? NSStackView {
+            extra = " 轴=\(stack.orientation == .horizontal ? "H" : "V")"
+                + " 对齐=\(stack.alignment.rawValue)"
+        }
+        print("\(indent)\(name) \(Int(root.frame.width))×\(Int(root.frame.height))\(extra)")
+        guard depth < 4 else { return }
+        for sub in root.subviews { dumpWelcomeHierarchy(sub, depth: depth + 1) }
+    }
+
+    /// The width a string actually occupies when drawn, measured from pixels.
+    ///
+    /// `NSString.size(withAttributes:)` reports the *layout* width, which can
+    /// disagree with the ink when a glyph comes from a fallback font — and a
+    /// label sized to the smaller number clips the last glyph, with no ellipsis.
+    private static func inkWidth(of text: String, font: NSFont) -> CGFloat? {
+        let attributed = NSAttributedString(string: text,
+                                            attributes: [.font: font,
+                                                         .foregroundColor: NSColor.black])
+        let layout = attributed.size()
+        let w = Int(ceil(layout.width)) + 40
+        let h = Int(ceil(layout.height)) + 20
+        guard w > 0, h > 0,
+              let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                         pixelsWide: w, pixelsHigh: h,
+                                         bitsPerSample: 8, samplesPerPixel: 4,
+                                         hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSColor.white.setFill()
+        NSRect(x: 0, y: 0, width: w, height: h).fill()
+        attributed.draw(at: NSPoint(x: 5, y: 5))
+        NSGraphicsContext.restoreGraphicsState()
+
+        var minX = w
+        var maxX = -1
+        for x in 0..<w {
+            for y in 0..<h {
+                guard let c = rep.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+                if c.redComponent < 0.5 {
+                    minX = min(minX, x)
+                    maxX = max(maxX, x)
+                }
+            }
+        }
+        return maxX >= minX ? CGFloat(maxX - minX + 1) : 0
+    }
+
+    /// Regression: the welcome page's shortcut list showed `⌃Spa` instead of
+    /// `⌃Space` — clipped mid-glyph, with no ellipsis, while the description
+    /// beside it was intact. That combination means the *key column* was too
+    /// narrow, not that the whole row was squeezed.
+    private static func testWelcomeShortcutLayout() {
+        section("欢迎页快捷键（回归：⌃Space 显示不全）")
+
+        // ---- first: does the measuring API agree with what actually gets drawn?
+        //      The keys are drawn in a monospaced font, and `⌃` (U+2303) is a
+        //      symbol such fonts often lack, so it falls back to another face.
+        let font = Fonts.code(size: 11)
+        for key in ["⌘S", "⌃Space", "⌘⇧O", "⌘`"] {
+            let layout = ceil((key as NSString).size(withAttributes: [.font: font]).width)
+            guard let ink = inkWidth(of: key, font: font) else {
+                check("能测量 \(key) 的绘制宽度", false)
+                continue
+            }
+            check("\(key)：绘制宽度不超过测量宽度（否则标签会切掉最后一个字符）",
+                  ink <= layout + 0.5,
+                  detail: "测量 \(Int(layout))，实绘 \(Int(ink))")
+        }
+
+        // ---- and the label itself must be wide enough for what it draws
+        func textFields(in view: NSView) -> [NSTextField] {
+            var out: [NSTextField] = []
+            if let field = view as? NSTextField { out.append(field) }
+            for sub in view.subviews { out.append(contentsOf: textFields(in: sub)) }
+            return out
+        }
+
+        let keys = ["⌘⇧O", "⌘O", "⌘S", "⌘⇧S", "⌘P", "⌃Space", "⌘/", "⌘F",
+                    "⌘⇧F", "⌘`", "⌘⇧G", "⌘⇧A"]
+
+        for width in [1400.0, 900.0, 700.0, 560.0, 420.0, 300.0] {
+            let view = WelcomeView(frame: NSRect(x: 0, y: 0, width: width, height: 720))
+            view.layoutSubtreeIfNeeded()
+            let fields = textFields(in: view)
+
+            var problems: [String] = []
+            for key in keys {
+                guard let field = fields.first(where: { $0.stringValue == key }) else {
+                    problems.append("\(key) 未渲染")
+                    continue
+                }
+                let need = inkWidth(of: key, font: field.font ?? font) ?? 0
+                // Two failures look identical on screen but have different causes:
+                // the label is narrower than its ink (it clips), or the label is
+                // wide enough but an ancestor clips it.
+                if field.frame.width + 0.5 < need {
+                    problems.append("\(key) 标签 \(Int(field.frame.width)) < 实绘 \(Int(need))")
+                    continue
+                }
+                let onScreen = field.convert(field.bounds, to: view)
+                if onScreen.minX < -0.5 || onScreen.maxX > view.bounds.width + 0.5 {
+                    problems.append("\(key) 被祖先裁切 "
+                        + "\(Int(onScreen.minX))…\(Int(onScreen.maxX))"
+                        + " 超出 0…\(Int(view.bounds.width))")
+                }
+            }
+            if problems.isEmpty {
+                print("      编辑器宽 \(Int(width))：快捷键全部完整")
+            } else {
+                print("      编辑器宽 \(Int(width))：\(problems.joined(separator: "，"))")
+            }
+            check("编辑器宽 \(Int(width)) 时快捷键完整可见",
+                  problems.isEmpty, detail: problems.joined(separator: "，"))
+        }
+    }
+
+    // MARK: - File tree root
+
+    /// Opening a project must put the project itself at the top of the tree, so the
+    /// whole tree can be folded away.
+    ///
+    /// It used to list the root's *children* at the top level, with the folder name
+    /// appearing only in the panel header — so there was nothing to collapse.
+    private static func testFileTreeRootNode() {
+        section("文件树根节点（项目名应作为可折叠的根）")
+
+        let fm = FileManager.default
+        let base = fm.temporaryDirectory
+            .appendingPathComponent("bonecode-tree-\(UUID().uuidString)")
+        let sub = base.appendingPathComponent("Sources")
+        try? fm.createDirectory(at: sub, withIntermediateDirectories: true)
+        try? "x\n".write(to: base.appendingPathComponent("README.md"),
+                         atomically: true, encoding: .utf8)
+        try? "y\n".write(to: sub.appendingPathComponent("main.swift"),
+                         atomically: true, encoding: .utf8)
+        defer { try? fm.removeItem(at: base) }
+
+        let tree = FileTreeViewController()
+        _ = tree.view                                  // force loadView
+        // Cast to the concrete type: the data source methods are optional protocol
+        // requirements, and this also proves the outline view is wired to the
+        // controller rather than to something else.
+        guard let outline = firstView(ofType: NSOutlineView.self, in: tree.view),
+              let source = outline.dataSource as? FileTreeViewController else {
+            check("文件树里有 NSOutlineView，且数据源是 FileTreeViewController", false)
+            return
+        }
+
+        // ---- with nothing open there is no root row at all
+        tree.setRoot(nil)
+        check("未打开项目时树为空",
+              source.outlineView(outline, numberOfChildrenOfItem: nil) == 0,
+              detail: "\(source.outlineView(outline, numberOfChildrenOfItem: nil))")
+
+        // ---- open the project
+        tree.setRoot(base)
+        let topCount = source.outlineView(outline, numberOfChildrenOfItem: nil)
+        check("打开项目后顶层只有 1 项（项目根）", topCount == 1, detail: "\(topCount)")
+        guard topCount == 1,
+              let root = source.outlineView(outline, child: 0, ofItem: nil) as? FileNode else {
+            check("顶层项是 FileNode", false)
+            return
+        }
+        check("根节点名字是项目文件夹名", root.name == base.lastPathComponent,
+              detail: "\(root.name) vs \(base.lastPathComponent)")
+        check("根节点路径就是项目路径", root.path == base.path, detail: root.path)
+        check("根节点是可展开的目录", source.outlineView(outline, isItemExpandable: root))
+
+        // ---- the project's entries are one level down, under the root
+        let childCount = source.outlineView(outline, numberOfChildrenOfItem: root)
+        check("根节点下能看到项目内容", childCount >= 2, detail: "\(childCount)")
+        let names = (0..<childCount)
+            .compactMap { source.outlineView(outline, child: $0, ofItem: root) as? FileNode }
+            .map(\.name)
+        check("根节点下包含 README.md 与 Sources",
+              names.contains("README.md") && names.contains("Sources"),
+              detail: names.joined(separator: ", "))
+        check("顶层不再直接暴露项目内容（内容在根节点之下）",
+              source.outlineView(outline, child: 0, ofItem: nil) as? FileNode === root)
+
+        // ---- opening a project still reveals its contents; the root is there so
+        //      the tree *can* be folded, not so it starts hidden
+        check("打开项目后根节点默认展开", outline.isItemExpanded(root))
+
+        // ---- and the root must not be a target for move / rename operations.
+        //      Before the root was a row these could never reach it; now one
+        //      mis-click could trash the entire project.
+        outline.selectRowIndexes(IndexSet(integer: 0), byExtendingSelection: false)
+        check("根节点可以选中", outline.selectedRow == 0, detail: "\(outline.selectedRow)")
+
+        for (title, selector) in [("移到废纸篓", "trashAction"),
+                                  ("重命名", "renameAction"),
+                                  ("创建副本", "duplicateAction")] {
+            let item = NSMenuItem(title: title,
+                                  action: NSSelectorFromString(selector),
+                                  keyEquivalent: "")
+            check("选中项目根目录时「\(title)」不可用（否则会动到整个项目）",
+                  !tree.validateMenuItem(item))
+        }
+        for (title, selector) in [("在 Finder 中显示", "revealAction"),
+                                  ("复制路径", "copyPathAction"),
+                                  ("在此处打开终端", "openTerminalAction")] {
+            let item = NSMenuItem(title: title,
+                                  action: NSSelectorFromString(selector),
+                                  keyEquivalent: "")
+            check("选中项目根目录时「\(title)」仍可用", tree.validateMenuItem(item))
+        }
+
+        // ---- the guard must be on the actions themselves, not only on the menu:
+        //      a selector can be invoked without going through validation.
+        check("项目根节点在树上可折叠（点一下就收起）", outline.isItemExpanded(root))
+        outline.collapseItem(root)
+        check("收起后根节点仍然存在（只是内容隐藏）",
+              source.outlineView(outline, numberOfChildrenOfItem: nil) == 1
+                  && !outline.isItemExpanded(root))
+
+        tree.setRoot(nil)
+    }
+
+    // MARK: - Commit busy state
+
+    /// Regression: clicking 提交 gave no sign it had registered.
+    ///
+    /// `git commit` only returns once the pre-commit hook has finished, and a
+    /// husky + lint-staged hook runs the whole linter first — many seconds on a
+    /// real project. The row showed nothing in the meantime, so the click looked
+    /// ignored and got repeated.
+    private static func testCommitBusyState() {
+        section("提交进行中的可见反馈（回归：点了看不出来）")
+
+        let fm = FileManager.default
+        let repo = fm.temporaryDirectory
+            .appendingPathComponent("bonecode-busy-\(UUID().uuidString)")
+        try? fm.createDirectory(at: repo, withIntermediateDirectories: true)
+        defer {
+            GitService.shared.close()
+            try? fm.removeItem(at: repo)
+        }
+        let git = ProcessRunner.gitPath()
+        func gitRun(_ args: [String]) -> ProcessResult {
+            ProcessRunner.run(git, args, cwd: repo.path)
+        }
+        _ = gitRun(["init", "-q", "-b", "main"])
+        _ = gitRun(["config", "user.email", "test@bonecode.local"])
+        _ = gitRun(["config", "user.name", "BoneCode Test"])
+        _ = gitRun(["config", "commit.gpgsign", "false"])
+        try? "one\n".write(to: repo.appendingPathComponent("a.txt"),
+                           atomically: true, encoding: .utf8)
+        _ = gitRun(["add", "-A"])
+        _ = gitRun(["commit", "-q", "-m", "chore: seed"])
+        check("测试仓库已打开", GitService.shared.openRepository(at: repo.path))
+
+        let hook = repo.appendingPathComponent(".git/hooks/pre-commit")
+
+        let view = GitChangesView(frame: NSRect(x: 0, y: 0, width: 420, height: 720))
+        var infos: [String] = []
+        var errors: [String] = []
+        view.onInfo = { infos.append($0) }
+        view.onError = { errors.append($0) }
+
+        func commitButton() -> NSButton? {
+            allButtons(in: view).first { $0.title == "提交" }
+        }
+        func showsBusyMessage() -> Bool {
+            allTextFields(in: view).contains { $0.stringValue.contains("正在提交") }
+        }
+        func statusText() -> String {
+            allTextFields(in: view).map(\.stringValue).joined(separator: " | ")
+        }
+
+        // ---- a hook that takes a moment, like lint-staged on a real project
+        try? "#!/bin/sh\nsleep 1.2\nexit 0\n".write(to: hook, atomically: true, encoding: .utf8)
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
+
+        try? "one\ntwo\n".write(to: repo.appendingPathComponent("a.txt"),
+                                atomically: true, encoding: .utf8)
+        _ = gitRun(["add", "-A"])
+
+        var captured: GitRepoState?
+        GitService.shared.state { captured = $0 }
+        pumpRunLoop(seconds: 3) { captured != nil }
+        view.update(with: captured)
+        check("暂存后「提交」按钮可用", commitButton()?.isEnabled == true)
+        check("空闲时不显示进度提示", !showsBusyMessage(), detail: statusText())
+
+        // ---- click, then look *immediately*: the hook is still running
+        view.commitMessage = "chore: 进行中反馈测试"
+        _ = view.perform(NSSelectorFromString("doCommit"))
+        check("点下提交后立刻显示进度提示（不是等 git 返回才显示）",
+              showsBusyMessage(), detail: statusText())
+        check("提交进行中时按钮被禁用（防止重复点击排队）",
+              commitButton()?.isEnabled == false)
+
+        // ---- a watcher-triggered refresh must not wipe the message
+        view.update(with: captured)
+        check("提交进行中时刷新不会覆盖进度提示",
+              showsBusyMessage(), detail: statusText())
+
+        // ---- and the row must come back when the commit finishes
+        pumpRunLoop(seconds: 6) { commitButton()?.isEnabled == true }
+        check("提交完成后按钮恢复可用", commitButton()?.isEnabled == true,
+              detail: statusText())
+        check("提交完成后进度提示消失", !showsBusyMessage(), detail: statusText())
+        check("提交成功后清空提交信息框", view.commitMessage.isEmpty,
+              detail: "'\(view.commitMessage)'")
+        check("提交成功后给出反馈", infos.contains { $0.contains("提交成功") },
+              detail: "\(infos)")
+
+        // ---- a FAILED commit must unlock the row, not leave it stuck disabled
+        try? "#!/bin/sh\necho 'lint 检查没通过' >&2\nexit 1\n"
+            .write(to: hook, atomically: true, encoding: .utf8)
+        try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
+        try? "one\ntwo\nthree\n".write(to: repo.appendingPathComponent("a.txt"),
+                                       atomically: true, encoding: .utf8)
+        _ = gitRun(["add", "-A"])
+        GitService.shared.state { captured = $0 }
+        pumpRunLoop(seconds: 3) { captured != nil }
+        view.update(with: captured)
+
+        errors.removeAll()
+        view.commitMessage = "chore: 失败也要解锁"
+        _ = view.perform(NSSelectorFromString("doCommit"))
+        pumpRunLoop(seconds: 6) { !errors.isEmpty }
+        check("提交被钩子拦下时报告错误", !errors.isEmpty, detail: "\(errors)")
+        check("提交失败后按钮恢复可用（不会卡在禁用状态）",
+              commitButton()?.isEnabled == true, detail: statusText())
+        check("提交失败后进度提示消失", !showsBusyMessage(), detail: statusText())
+        check("提交失败时保留提交信息（否则白写了）",
+              view.commitMessage == "chore: 失败也要解锁", detail: view.commitMessage)
+    }
+
     // MARK: - PTY
 
     private static func testPTYEndToEnd() {
@@ -1831,6 +2484,24 @@ enum SelfTest {
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
 
+        // The launch frame depends on stored state: with the "user has sized the
+        // window" flag set, the window deliberately restores what the user chose
+        // instead of adapting to the display. That is correct behaviour, but it
+        // would make the assertions below depend on whatever this machine happens
+        // to have stored — so take a clean state for the duration and put it back.
+        let defaults = UserDefaults.standard
+        let frameKey = "NSWindow Frame \(MainWindowController.frameAutosaveName)"
+        let savedFlag = defaults.object(forKey: MainWindowController.userSizedMarker)
+        let savedFrame = defaults.string(forKey: frameKey)
+        defaults.removeObject(forKey: MainWindowController.userSizedMarker)
+        defaults.removeObject(forKey: frameKey)
+        defer {
+            if let savedFlag {
+                defaults.set(savedFlag, forKey: MainWindowController.userSizedMarker)
+            }
+            if let savedFrame { defaults.set(savedFrame, forKey: frameKey) }
+        }
+
         let controller = MainWindowController()
         let main = controller.mainViewController
 
@@ -1859,6 +2530,80 @@ enum SelfTest {
                       content.frame.height < window.frame.height,
                       detail: "content=\(content.frame.height) window=\(window.frame.height)")
             }
+        }
+
+        // ---- the launch window must actually use the display.
+        //
+        //      It used to open at 820×572 — exactly its minimum width — because
+        //      assigning `contentViewController` (and later the toolbar) resized
+        //      the window after the frame had been set. On screen that left the
+        //      editor about 230 pt wide, so content looked cut off.
+        if let window = controller.window, let screen = window.screen ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            let frame = window.frame
+            print("      屏幕可见区 \(Int(visible.width))×\(Int(visible.height))"
+                  + " · 窗口 \(Int(frame.width))×\(Int(frame.height))"
+                  + " @ (\(Int(frame.minX)),\(Int(frame.minY)))"
+                  + " · 占屏 \(Int(frame.width / visible.width * 100))%×"
+                  + "\(Int(frame.height / visible.height * 100))%")
+
+            check("启动窗口不超过屏幕可见区宽度",
+                  frame.width <= visible.width + 1,
+                  detail: "\(Int(frame.width)) vs \(Int(visible.width))")
+            check("启动窗口不超过屏幕可见区高度",
+                  frame.height <= visible.height + 1,
+                  detail: "\(Int(frame.height)) vs \(Int(visible.height))")
+            check("启动窗口完全落在屏幕可见区内",
+                  visible.contains(frame),
+                  detail: "window=\(frame) visible=\(visible)")
+            check("启动窗口至少占屏 85%（不再缩到最小尺寸）",
+                  frame.width >= visible.width * 0.85 && frame.height >= visible.height * 0.85,
+                  detail: String(format: "%.0f%% × %.0f%%",
+                                 frame.width / visible.width * 100,
+                                 frame.height / visible.height * 100))
+            check("启动窗口不低于窗口最小尺寸",
+                  frame.width >= 820 && frame.height >= 520,
+                  detail: "\(Int(frame.width))×\(Int(frame.height))")
+            check("启动窗口左右留白基本对称（居中）",
+                  abs(frame.minX - visible.minX - (visible.maxX - frame.maxX)) <= 2,
+                  detail: String(format: "左 %.0f 右 %.0f",
+                                 frame.minX - visible.minX, visible.maxX - frame.maxX))
+        }
+
+        // ---- the welcome page's shortcut keys must be fully drawn, in the real
+        //      window. A standalone WelcomeView does not reproduce the problem:
+        //      whether the key column gets squeezed depends on the whole chain
+        //      (window → split view → editor area → welcome column → grid).
+        main.view.layoutSubtreeIfNeeded()
+        if let welcome = firstView(ofType: WelcomeView.self, in: main.view) {
+            let welcomeWidth = welcome.bounds.width
+            let fields = allTextFields(in: welcome)
+            var problems: [String] = []
+            for key in ["⌘⇧O", "⌃Space", "⌘⇧S", "⌘⇧F", "⌘⇧G", "⌘⇧A"] {
+                guard let field = fields.first(where: { $0.stringValue == key }) else {
+                    problems.append("\(key) 未渲染")
+                    continue
+                }
+                let need = inkWidth(of: key, font: field.font ?? Fonts.code(size: 11)) ?? 0
+                print("      \(key): frame=\(Int(field.frame.width))"
+                      + " intrinsic=\(Int(field.intrinsicContentSize.width))"
+                      + " 实绘=\(Int(need))"
+                      + " 字体=\(field.font?.fontName ?? "nil")"
+                      + " 对齐=\(field.alignment.rawValue)")
+                if field.frame.width + 0.5 < need {
+                    problems.append("\(key) 标签 \(Int(field.frame.width)) < 实绘 \(Int(need))")
+                }
+            }
+            print("      欢迎页宽 \(Int(welcomeWidth))"
+                  + " · 快捷键列\(problems.isEmpty ? "完整" : "有问题")")
+            if !problems.isEmpty { dumpWelcomeHierarchy(welcome) }
+            check("真实窗口里欢迎页快捷键完整显示（回归：⌃Space 被切成 ⌃Spa）",
+                  problems.isEmpty,
+                  detail: "欢迎页宽 \(Int(welcomeWidth))：" + problems.joined(separator: "，"))
+            check("欢迎页宽度足以容纳快捷键列（否则说明编辑器太窄）",
+                  welcomeWidth >= 400, detail: "\(Int(welcomeWidth)) pt")
+        } else {
+            check("能找到欢迎页视图", false)
         }
 
         // ---- open a real workspace

@@ -14,6 +14,16 @@ struct ProcessResult {
         }
         return s
     }
+
+    /// A message worth showing the user when the command failed.
+    ///
+    /// Git writes plenty of errors to stdout rather than stderr, so `combined` is
+    /// the right source. The action name is only used when the command said
+    /// nothing at all, which otherwise produces an empty alert.
+    func failureText(_ action: String) -> String {
+        let detail = combined.trimmed
+        return detail.isEmpty ? "\(action)失败（退出码 \(exitCode)）" : detail
+    }
 }
 
 /// Thin wrapper over `Process` with a GUI-friendly environment.
